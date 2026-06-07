@@ -120,34 +120,34 @@ def calculate_chunk_plan(
     rejection_reason  = ""
 
     if override_memory_str:
-        override_gb = _parse_memory_to_gb(override_memory_str)
+    override_gb = _parse_memory_to_gb(override_memory_str)
 
-            if override_gb > available_ram_gb:
-            # Override metrics step beyond system capacities → OOM Risk
-            override_rejected = True
-            rejection_reason  = (
-                f"Override={override_gb}g > available={available_ram_gb:.1f}g. "
-                "Switching to inferred configurations to mitigate OOM threats."
-            )
-            logger.warning(rejection_reason)
+    if override_gb > available_ram_gb:
+        # Override metrics step beyond system capacities → OOM Risk
+        override_rejected = True
+        rejection_reason  = (
+            f"Override={override_gb}g > available={available_ram_gb:.1f}g. "
+            "Switching to inferred configurations to mitigate OOM threats."
+        )
+        logger.warning(rejection_reason)
 
-            # Fall back and evaluate system inference vectors safely
-            if inferred_memory_gb <= available_ram_gb:
-                safe_memory_gb = inferred_memory_gb
-                memory_source  = "inferred"
-            else:
-                # System inferences breach limits too → Restrict allocation safely to 85% of active headroom
-                safe_memory_gb = round(available_ram_gb * 0.85, 1)
-                memory_source  = "conservative"
-                logger.warning(
-                    "Inferred memory targets (%.1fg) exceed active unallocated headroom (%.1fg). "
-                    "Applying conservative constraints: %.1fg",
-                    inferred_memory_gb, available_ram_gb, safe_memory_gb
-                )
+        # Fall back and evaluate system inference vectors safely
+        if inferred_memory_gb <= available_ram_gb:
+            safe_memory_gb = inferred_memory_gb
+            memory_source  = "inferred"
         else:
-            # Override configurations fall within safe bounds
-            safe_memory_gb = override_gb
-            memory_source  = "override"
+            # System inferences breach limits too → Restrict allocation safely to 85% of active headroom
+            safe_memory_gb = round(available_ram_gb * 0.85, 1)
+            memory_source  = "conservative"
+            logger.warning(
+                "Inferred memory targets (%.1fg) exceed active unallocated headroom (%.1fg). "
+                "Applying conservative constraints: %.1fg",
+                inferred_memory_gb, available_ram_gb, safe_memory_gb
+            )
+    else:
+        # Override configurations fall within safe bounds
+        safe_memory_gb = override_gb
+        memory_source  = "override"
 
     elif inferred_memory_gb <= available_ram_gb:
         safe_memory_gb = inferred_memory_gb
