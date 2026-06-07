@@ -70,40 +70,40 @@ def load_tissue_mapping(
 
         # Validate presence of schema identifier targets
         if SAMPID_COL not in columns:
-        raise KeyError(
-            f"Required key column identifier '{SAMPID_COL}' absent from schema metadata inside {path}. "
-            f"Available heading tracks up to index limit: {columns[:10]}..."
-        )
-    if SMTSD_COL not in columns:
-        raise KeyError(
-            f"Required dimension column identifier '{SMTSD_COL}' absent from schema metadata inside {path}. "
-            f"Available heading tracks up to index limit: {columns[:10]}..."
-        )
+            raise KeyError(
+                f"Required key column identifier '{SAMPID_COL}' absent from schema metadata inside {path}. "
+                f"Available heading tracks up to index limit: {columns[:10]}..."
+            )
+        if SMTSD_COL not in columns:
+            raise KeyError(
+                f"Required dimension column identifier '{SMTSD_COL}' absent from schema metadata inside {path}. "
+                f"Available heading tracks up to index limit: {columns[:10]}..."
+            )
 
         sampid_idx = columns.index(SAMPID_COL)
         smtsd_idx  = columns.index(SMTSD_COL)
 
         for line in f:
-        total_rows += 1
-        parts = line.rstrip("\n").split("\t")
+            total_rows += 1
+            parts = line.rstrip("\n").split("\t")
 
-        # Boundary protection logic avoiding index errors on fragmented lines
-        if len(parts) <= max(sampid_idx, smtsd_idx):
-            skipped_empty += 1
-            continue
+            # Boundary protection logic avoiding index errors on fragmented lines
+            if len(parts) <= max(sampid_idx, smtsd_idx):
+                skipped_empty += 1
+                continue
 
-        sample_id = parts[sampid_idx].strip()
-        tissue_id = parts[smtsd_idx].strip()
+            sample_id = parts[sampid_idx].strip()
+            tissue_id = parts[smtsd_idx].strip()
 
-        if not sample_id or not tissue_id:
-            skipped_empty += 1
-            logger.debug(
-                "Dropping incomplete line item record — Captured inputs: SAMPID='%s' SMTSD='%s'",
-                sample_id, tissue_id
-            )
-            continue
+            if not sample_id or not tissue_id:
+                skipped_empty += 1
+                logger.debug(
+                    "Dropping incomplete line item record — Captured inputs: SAMPID='%s' SMTSD='%s'",
+                    sample_id, tissue_id
+                )
+                continue
 
-        mapping[sample_id] = tissue_id
+            mapping[sample_id] = tissue_id
 
     if skipped_empty > 0:
         logger.warning(
