@@ -1,36 +1,36 @@
 """
 src/jobs/gold_transform.py
 
-Orquestador Gold — capa final del pipeline Bio-AI Lakehouse.
+Gold Orchestrator — Final layer of the Bio-AI Lakehouse pipeline.
 
-Qué hace:
-    1. Carga Silver lineage para obtener tissue_count esperado
-    2. Itera Silver en batches via SilverBatchReader (sin cargar todo en RAM)
-    3. Acumula estadísticos por grupo (gene_id, gene_symbol, tissue_id)
-       con Welford online (mean/std) y reservoir sampling (median)
-       via numpy memmap — arrays en disco, RAM constante ~200MB
-    4. Serializa acumuladores a pa.Table
-    5. Escribe Delta Lake Gold con ZSTD via write_deltalake
-    6. Corre quality gate Gold (run_gold_checks)
-    7. Actualiza data lineage (gold_metadata.json + pipeline_lineage.json)
+What it does:
+    1. Loads Silver lineage to retrieve the expected tissue_count
+    2. Iterates over Silver in batches via SilverBatchReader (avoiding massive RAM overhead)
+    3. Accumulates statistics per group (gene_id, gene_symbol, tissue_id)
+       using online Welford (mean/std) and reservoir sampling (median)
+       via numpy memmap — disk-backed arrays keeping RAM constant at ~200MB
+    4. Serializes accumulators into a pa.Table
+    5. Writes Gold Delta Lake with ZSTD compression via write_deltalake
+    6. Runs Gold quality gate checks (run_gold_checks)
+    7. Updates data lineage (gold_metadata.json + pipeline_lineage.json)
 
-RAM máxima estimada:
-    ~200MB memmap activo + ~100MB batch Silver = ~300MB constante
-    Sin OOM sin importar cuántos grupos haya.
+Estimated peak RAM:
+    ~200MB active memmap + ~100MB Silver batch = ~300MB constant footprint
+    No OOM exceptions regardless of the number of unique groups.
 
-Uso:
+Usage:
     docker exec -it --workdir /opt/spark/work-dir spark-master \
     env PYTHONPATH=. python3 src/jobs/gold_transform.py
 
-    # Saltar quality gate (solo debug):
+    # Skip quality gate (debug only):
     env PYTHONPATH=. python3 src/jobs/gold_transform.py --skip-quality
 
-    # Resumir desde cache existente (si el proceso se interrumpió):
+    # Resume from an existing cache (if the process was interrupted):
     env PYTHONPATH=. python3 src/jobs/gold_transform.py --resume
 
-Idempotencia:
-    write_deltalake con mode='overwrite' — si Gold existe parcial, se limpia.
-    Re-ejecutar sin --resume es seguro.
+Idempotency:
+    write_deltalake using mode='overwrite' — if a partial Gold state exists, it is wiped clean.
+    Re-running without --resume is safe.
 """
 
 import argparse
@@ -59,7 +59,7 @@ from src.utils.quality_checks import (
 )
 
 # ─────────────────────────────────────────────
-#  Configuración
+#  Configuration
 # ─────────────────────────────────────────────
 
 SILVER_ROOT          = "data/silver/gtex/gene_expression_long"
@@ -71,7 +71,7 @@ SILVER_LINEAGE_PATH  = "data/lineage/silver_metadata.json"
 EXPECTED_GENES   = 74_628
 EXPECTED_TISSUES = 68
 
-# Flush del cache a disco cada N filas — protege contra crashes
+# Flush cache to disk every N rows — protects against unexpected crashes
 FLUSH_EVERY_ROWS = 50_000_000
 
 logging.basicConfig(
@@ -83,14 +83,14 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  Paso 1 — Cargar Silver lineage
+#  Step 1 — Load Silver Lineage
 # ─────────────────────────────────────────────
 
 def load_silver_lineage() -> Dict[str, Any]:
     lineage = load_lineage(SILVER_LINEAGE_PATH)
     if not lineage:
         logger.warning(
-            "Silver lineage no encontrado en %s — usando defaults",
+            "Silver lineage not found at %s — falling back to defaults",
             SILVER_LINEAGE_PATH,
         )
         return {
@@ -102,7 +102,7 @@ def load_silver_lineage() -> Dict[str, Any]:
             "generated_at_utc": "unknown",
         }
     logger.info(
-        "Silver lineage cargado — tissue_count=%s, row_count=%s",
+        "Silver lineage loaded — tissue_count=%s, row_count=%s",
         lineage.get("output", {}).get("tissue_count", "?"),
         f"{lineage.get('output', {}).get('row_count', 0):,}",
     )
@@ -110,20 +110,20 @@ def load_silver_lineage() -> Dict[str, Any]:
 
 
 # ─────────────────────────────────────────────
-#  Paso 2-3 — Iterar Silver y acumular
+#  Step 2-3 — Iterate Silver and Accumulate
 # ─────────────────────────────────────────────
 
 def accumulate_silver(acc_map: GoldAccumulatorMap, resume: bool = False) -> SilverBatchReader:
     """
-    Lee Silver completo en batches y actualiza los acumuladores memmap.
-    Flushea a disco cada FLUSH_EVERY_ROWS filas — protege contra crashes.
+    Reads the entire Silver layer in batches and updates the memmap accumulators.
+    Flushes cache to disk every FLUSH_EVERY_ROWS to protect against crashes.
     """
     reader     = SilverBatchReader(SILVER_ROOT)
     total_rows = 0
     rows_since_flush = 0
     start_ts   = time.time()
 
-    logger.info("Iniciando acumulación Silver → Gold (%s archivos)...",
+    logger.info("Starting Silver → Gold accumulation (%s assets)...",
                 f"{reader.total_files:,}")
 
     for batch in reader.iter_batches():
@@ -131,31 +131,31 @@ def accumulate_silver(acc_map: GoldAccumulatorMap, resume: bool = False) -> Silv
         total_rows       += batch.num_rows
         rows_since_flush += batch.num_rows
 
-        # Flush periódico a disco
+        # Periodic disk flush
         if rows_since_flush >= FLUSH_EVERY_ROWS:
             acc_map.flush()
             rows_since_flush = 0
-            logger.info("Cache flusheado a disco — %s grupos únicos",
+            logger.info("Cache successfully flushed to disk — %s unique groups tracked",
                         f"{acc_map.group_count:,}")
 
-        # Log de progreso cada 50M filas
+        # Progress tracking log every 50M rows
         if total_rows % 50_000_000 < batch.num_rows:
             elapsed  = time.time() - start_ts
             pct      = total_rows / 1_476_738_864 * 100
             ram_gb   = psutil.virtual_memory().available / 1024 ** 3
             logger.info(
-                "Progreso: %s filas (%.1f%%) | grupos=%s | RAM libre=%.1fGB | %.0fs",
+                "Progress: %s rows transformed (%.1f%%) | unique_groups=%s | Free RAM=%.1fGB | Time: %.0fs",
                 f"{total_rows:,}", pct,
                 f"{acc_map.group_count:,}",
                 ram_gb, elapsed,
             )
 
-    # Flush final
+    # Final persistent flush
     acc_map.flush()
 
     elapsed_total = time.time() - start_ts
     logger.info(
-        "Acumulación completa: %s filas en %.0fs | %s grupos únicos",
+        "Accumulation completed successfully: %s rows handled in %.0fs | %s total unique groups",
         f"{reader.rows_yielded:,}", elapsed_total,
         f"{acc_map.group_count:,}",
     )
@@ -163,12 +163,12 @@ def accumulate_silver(acc_map: GoldAccumulatorMap, resume: bool = False) -> Silv
 
 
 # ─────────────────────────────────────────────
-#  Paso 4-5 — Serializar y escribir Delta Gold
+#  Step 4-5 — Serialize and Commit Gold Delta
 # ─────────────────────────────────────────────
 
 def write_gold(gold_table: pa.Table) -> None:
     logger.info(
-        "Escribiendo Gold Delta Lake: %s filas → %s",
+        "Committing Gold Delta Lake table: %s rows → %s",
         f"{gold_table.num_rows:,}", GOLD_PATH,
     )
 
@@ -184,16 +184,16 @@ def write_gold(gold_table: pa.Table) -> None:
         },
     )
 
-    logger.info("Gold escrito exitosamente en %s", GOLD_PATH)
+    logger.info("Gold layer successfully committed to storage at %s", GOLD_PATH)
 
 
 # ─────────────────────────────────────────────
-#  Paso 6 — Quality gate Gold
+#  Step 6 — Gold Quality Gate Checks
 # ─────────────────────────────────────────────
 
 def run_quality_gate(gold_table: pa.Table, skip: bool = False) -> Dict[str, Any]:
     if skip:
-        logger.warning("Quality gate Gold OMITIDO (--skip-quality activo)")
+        logger.warning("Gold quality gate checks SKIPPED (--skip-quality flag active)")
         return {"layer": "gold", "passed": True, "skipped": True, "checks": []}
 
     rows = gold_table.to_pydict()
@@ -227,7 +227,7 @@ def run_quality_gate(gold_table: pa.Table, skip: bool = False) -> Dict[str, Any]
 
 
 # ─────────────────────────────────────────────
-#  Paso 7 — Lineage
+#  Step 7 — Metadata Lineage Tracking
 # ─────────────────────────────────────────────
 
 def update_lineage(
@@ -272,14 +272,14 @@ def update_lineage(
     save_lineage(gold_lineage,     GOLD_LINEAGE_PATH)
     save_lineage(pipeline_lineage, PIPELINE_LINEAGE_PATH)
 
-    logger.info("Lineage actualizado:")
+    logger.info("Data lineage records successfully updated:")
     logger.info("  %s", GOLD_LINEAGE_PATH)
     logger.info("  %s", PIPELINE_LINEAGE_PATH)
-    logger.info("  Pipeline status: %s", pipeline_lineage.get("status"))
+    logger.info("  Pipeline operational status: %s", pipeline_lineage.get("status"))
 
 
 # ─────────────────────────────────────────────
-#  Main
+#  Main Orchestrator Entrypoint
 # ─────────────────────────────────────────────
 
 def main(skip_quality: bool = False, resume: bool = False) -> None:
@@ -287,40 +287,40 @@ def main(skip_quality: bool = False, resume: bool = False) -> None:
 
     logger.info("══════════════════════════════════════════")
     logger.info("  Bio-AI Lakehouse — Gold Transform v3")
-    logger.info("  Modo: %s", "RESUME" if resume else "FRESH")
+    logger.info("  Execution Mode: %s", "RESUME" if resume else "FRESH")
     logger.info("══════════════════════════════════════════")
 
-    # Paso 1 — Silver lineage
+    # Step 1 — Load context from upstream Silver lineage
     silver_lineage = load_silver_lineage()
 
-    # Paso 2-3 — Acumular Silver via memmap
+    # Step 2-3 — Initialize memmap architecture and stream compute data
     acc_map = GoldAccumulatorMap(
         cache_dir = GOLD_CACHE_DIR,
         resume    = resume,
     )
     reader = accumulate_silver(acc_map, resume=resume)
 
-    # Paso 4 — Serializar a pa.Table
-    logger.info("Serializando acumuladores a pa.Table...")
+    # Step 4 — Serialize structured computational arrays to pa.Table
+    logger.info("Serializing analytical accumulators into a pa.Table structure...")
     gold_table = acc_map.to_arrow_table()
-    logger.info("pa.Table lista: %s filas × %s columnas",
+    logger.info("pa.Table processing ready: %s rows × %s columns mapped",
                 f"{gold_table.num_rows:,}", gold_table.num_columns)
 
-    # Paso 5 — Escribir Delta Gold
+    # Step 5 — Commit state to Gold Delta Lake target
     write_gold(gold_table)
 
-    # Paso 6 — Quality gate
+    # Step 6 — Run schema validation and evaluation quality gate
     quality_dict = run_quality_gate(gold_table, skip=skip_quality)
 
-    # Paso 7 — Lineage
+    # Step 7 — Package metrics and audit lineage
     duration = time.time() - start_total
     update_lineage(gold_table, quality_dict, duration)
 
     logger.info("══════════════════════════════════════════")
-    logger.info("  Gold Transform COMPLETO en %.0fs (%.1f min)",
+    logger.info("  Gold Transform SUCCESSFUL in %.0fs (%.1f min)",
                 duration, duration / 60)
-    logger.info("  Output: %s", GOLD_PATH)
-    logger.info("  Filas : %s", f"{gold_table.num_rows:,}")
+    logger.info("  Target location: %s", GOLD_PATH)
+    logger.info("  Total rows committed: %s", f"{gold_table.num_rows:,}")
     logger.info("══════════════════════════════════════════")
 
 
@@ -329,20 +329,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-quality",
         action="store_true",
-        help="Omitir quality gate Gold (solo para debug)",
+        help="Skip operational Gold quality gate checks (debug environment only)",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resumir desde cache memmap existente (si el proceso se interrumpió)",
+        help="Resume execution from existing memmap analytical cache state",
     )
     args = parser.parse_args()
 
     try:
         main(skip_quality=args.skip_quality, resume=args.resume)
     except PipelineQualityError as e:
-        logger.error("Pipeline detenido por quality gate: %s", e)
+        logger.error("Pipeline run terminated by quality gate assertion: %s", e)
         sys.exit(1)
     except Exception as e:
-        logger.error("Error inesperado: %s", e, exc_info=True)
+        logger.error("Unexpected runtime error intercepted: %s", e, exc_info=True)
         sys.exit(1)
