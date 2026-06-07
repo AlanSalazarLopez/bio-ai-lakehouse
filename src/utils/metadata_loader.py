@@ -1,19 +1,19 @@
 """
 src/utils/metadata_loader.py
 
-Carga el archivo de metadata de muestras GTEx y construye el mapping
-SAMPID → SMTSD (sample_id → tissue_id) para el join en Silver.
+Loads the GTEx sample metadata file and builds the SAMPID → SMTSD mapping
+(sample_id → tissue_id) used during the Silver-tier ingestion join pass.
 
-El archivo gtex_metadata.txt es un TSV con ~100 columnas. Solo nos
-interesan dos: SAMPID (key) y SMTSD (tejido destino).
+The gtex_metadata.txt file is a wide TSV file containing ~100 structural columns.
+This module extracts only two critical fields: SAMPID (key) and SMTSD (target tissue dimension).
 
-Función principal: load_tissue_mapping
-    → retorna dict {sample_id: tissue_id} listo para el join en Silver
+Primary Interface: load_tissue_mapping
+    → returns dict {sample_id: tissue_id} ready for the Silver tier join operations
 
-Función secundaria: validate_tissue_mapping
-    → verifica que el mapping no esté vacío y loguea stats básicas
+Secondary Interface: validate_tissue_mapping
+    → validates that the derived map contains data and records baseline footprint telemetry
 
-Compatible con Python 3.8 — usa Optional[X], no X | None.
+Strict Python 3.8 typing adherence (explicit Optional[X] over PEP 604 union structures).
 """
 
 import logging
@@ -21,43 +21,43 @@ from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Columnas que nos importan del TSV — el resto se ignora
+# Target columns extracted from the wide metadata TSV — all remaining attributes are skipped
 SAMPID_COL = "SAMPID"
 SMTSD_COL  = "SMTSD"
 
-# Ruta por defecto dentro del contenedor
+# Default execution deployment track within the container file system
 DEFAULT_METADATA_PATH = "data/raw/gtex_metadata.txt"
 
 
 # ─────────────────────────────────────────────
-#  Función principal
+#  Primary Ingestion Interface
 # ─────────────────────────────────────────────
 
 def load_tissue_mapping(
     path: str = DEFAULT_METADATA_PATH,
 ) -> Dict[str, str]:
     """
-    Lee gtex_metadata.txt y retorna un dict {sample_id → tissue_id}.
+    Parses gtex_metadata.txt and returns a lookup mapping dictionary: {sample_id → tissue_id}.
 
-    Solo carga las columnas SAMPID y SMTSD — ignora las ~100 restantes.
-    Filas con SAMPID o SMTSD vacíos se descartan y se loguean como warning.
+    Slices only the target columns SAMPID and SMTSD — ignoring the remaining ~100 attributes.
+    Records with empty or un-allocated values in either target column are omitted and logged as warnings.
 
     Args:
-        path: ruta al archivo TSV de metadata GTEx.
+        path: File system location path pointing to the raw GTEx metadata TSV file.
 
     Returns:
-        Dict[str, str] — {sample_id: tissue_id}
-        Ejemplo: {"GTEX-1117F-0005-SM-HL9SH": "Thyroid"}
+        Dict[str, str] — {sample_id: tissue_id} map structure.
+        Example block: {"GTEX-1117F-0005-SM-HL9SH": "Thyroid"}
 
     Raises:
-        FileNotFoundError: si el archivo no existe en la ruta indicada.
-        KeyError: si el archivo no tiene las columnas SAMPID o SMTSD.
+        FileNotFoundError: Triggered if the target metadata file path is invalid or absent.
+        KeyError: Triggered if specified target columns (SAMPID or SMTSD) are missing from the header line.
     """
     import os
     if not os.path.exists(path):
         raise FileNotFoundError(
-            f"Metadata GTEx no encontrada en: {path}\n"
-            f"Asegúrate de que el archivo esté en data/raw/"
+            f"GTEx metadata asset source not found at destination path: {path}\n"
+            f"Verify that the required source file is staged under: data/raw/"
         )
 
     mapping: Dict[str, str] = {}
@@ -68,51 +68,51 @@ def load_tissue_mapping(
         header_line = f.readline().rstrip("\n")
         columns     = header_line.split("\t")
 
-        # Validar que las columnas clave existen
+        # Validate presence of schema identifier targets
         if SAMPID_COL not in columns:
-            raise KeyError(
-                f"Columna '{SAMPID_COL}' no encontrada en {path}. "
-                f"Columnas disponibles: {columns[:10]}..."
-            )
-        if SMTSD_COL not in columns:
-            raise KeyError(
-                f"Columna '{SMTSD_COL}' no encontrada en {path}. "
-                f"Columnas disponibles: {columns[:10]}..."
-            )
+        raise KeyError(
+            f"Required key column identifier '{SAMPID_COL}' absent from schema metadata inside {path}. "
+            f"Available heading tracks up to index limit: {columns[:10]}..."
+        )
+    if SMTSD_COL not in columns:
+        raise KeyError(
+            f"Required dimension column identifier '{SMTSD_COL}' absent from schema metadata inside {path}. "
+            f"Available heading tracks up to index limit: {columns[:10]}..."
+        )
 
         sampid_idx = columns.index(SAMPID_COL)
         smtsd_idx  = columns.index(SMTSD_COL)
 
         for line in f:
-            total_rows += 1
-            parts = line.rstrip("\n").split("\t")
+        total_rows += 1
+        parts = line.rstrip("\n").split("\t")
 
-            # Protección contra líneas cortas malformadas
-            if len(parts) <= max(sampid_idx, smtsd_idx):
-                skipped_empty += 1
-                continue
+        # Boundary protection logic avoiding index errors on fragmented lines
+        if len(parts) <= max(sampid_idx, smtsd_idx):
+            skipped_empty += 1
+            continue
 
-            sample_id = parts[sampid_idx].strip()
-            tissue_id = parts[smtsd_idx].strip()
+        sample_id = parts[sampid_idx].strip()
+        tissue_id = parts[smtsd_idx].strip()
 
-            if not sample_id or not tissue_id:
-                skipped_empty += 1
-                logger.debug(
-                    "Fila descartada — SAMPID='%s' SMTSD='%s'",
-                    sample_id, tissue_id
-                )
-                continue
+        if not sample_id or not tissue_id:
+            skipped_empty += 1
+            logger.debug(
+                "Dropping incomplete line item record — Captured inputs: SAMPID='%s' SMTSD='%s'",
+                sample_id, tissue_id
+            )
+            continue
 
-            mapping[sample_id] = tissue_id
+        mapping[sample_id] = tissue_id
 
     if skipped_empty > 0:
         logger.warning(
-            "metadata_loader: %d/%d filas descartadas por SAMPID o SMTSD vacío",
+            "metadata_loader tracking: Omitted %d/%d entries due to blank value blocks in SAMPID or SMTSD positions",
             skipped_empty, total_rows
         )
 
     logger.info(
-        "metadata_loader: %d muestras cargadas desde %s",
+        "metadata_loader tracking: Successfully compiled %d sample records from target location: %s",
         len(mapping), path
     )
 
@@ -120,7 +120,7 @@ def load_tissue_mapping(
 
 
 # ─────────────────────────────────────────────
-#  Validación del mapping
+#  Mapping Evaluation Gate
 # ─────────────────────────────────────────────
 
 def validate_tissue_mapping(
@@ -128,21 +128,21 @@ def validate_tissue_mapping(
     min_samples: int = 100,
 ) -> Tuple[bool, str]:
     """
-    Verifica que el mapping tenga contenido suficiente para el join.
+    Evaluates the compiled mapping structure to guarantee sufficient sample density before pipeline execution.
 
     Args:
-        mapping:     resultado de load_tissue_mapping()
-        min_samples: mínimo de muestras esperadas (default 100)
+        mapping:     Extracted key-value lookup array resulting from load_tissue_mapping()
+        min_samples: Floor constraint defining the minimum volume threshold of required tracking records (default 100)
 
     Returns:
-        Tuple[bool, str] — (passed, mensaje)
+        Tuple[bool, str] — (passed, audit_message_details)
     """
     if not mapping:
-        return False, "mapping vacío — gtex_metadata.txt no cargó ninguna muestra"
+        return False, "Validation failure: Target map completely unpopulated — gtex_metadata.txt yielded 0 records."
 
     if len(mapping) < min_samples:
         return False, (
-            f"mapping demasiado pequeño: {len(mapping)} muestras < {min_samples} mínimo"
+            f"Validation failure: Target sample map volume falls beneath safety parameters: {len(mapping)} records < required floor configuration ({min_samples})."
         )
 
     tissues       = set(mapping.values())
@@ -154,17 +154,17 @@ def validate_tissue_mapping(
     bottom_tissue = min(tissue_counts, key=tissue_counts.__getitem__)
 
     msg = (
-        f"mapping válido: {len(mapping):,} muestras × {len(tissues)} tejidos | "
-        f"mayor={top_tissue} ({tissue_counts[top_tissue]:,}) | "
-        f"menor={bottom_tissue} ({tissue_counts[bottom_tissue]:,})"
+        f"Structural validation map verified: {len(mapping):,} samples parsed across {len(tissues)} distinct tissue sets | "
+        f"Max density track={top_tissue} ({tissue_counts[top_tissue]:,} records) | "
+        f"Min density track={bottom_tissue} ({tissue_counts[bottom_tissue]:,} records)"
     )
 
-    logger.info("validate_tissue_mapping: %s", msg)
+    logger.info("validate_tissue_mapping confirmation status: %s", msg)
     return True, msg
 
 
 # ─────────────────────────────────────────────
-#  Helper para el join en Silver
+#  Silver Ingestion Transformation Helpers
 # ─────────────────────────────────────────────
 
 def get_tissue_or_unknown(
@@ -173,19 +173,19 @@ def get_tissue_or_unknown(
     fallback: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Lookup seguro del tissue_id dado un sample_id.
-    Retorna None (o fallback) si no hay match — el caller decide si va a cuarentena.
+    Safely executes sample lookup queries against the memory lookup dictionary.
+    Returns None (or a specific fallback block target) if no match is hit — handing control to the caller to flag quarantine.
 
-    Uso en silver_transform.py:
+    Usage blueprint within silver_transform.py:
         tissue = get_tissue_or_unknown(mapping, sample_id)
         if tissue is None:
-            → quarantine
+            → routing downstream out to quarantine targets
     """
     return mapping.get(sample_id, fallback)
 
 
 # ─────────────────────────────────────────────
-#  CLI — smoke test
+#  Local Integration Validation Harness Sandbox (CLI Targets)
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -193,26 +193,26 @@ if __name__ == "__main__":
 
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_METADATA_PATH
 
-    print(f"\n── Cargando metadata desde: {path} ──────────")
+    print(f"\n── Loading dataset metadata from target destination: {path} ──────────")
     mapping = load_tissue_mapping(path)
 
     passed, msg = validate_tissue_mapping(mapping)
     status = "✅" if passed else "❌"
     print(f"{status} {msg}")
 
-    # Mostrar 3 ejemplos del mapping
-    print("\n── Ejemplos del mapping ──────────────────")
+    # Display a brief 3-element sample tranche of the dictionary mapping
+    print("\n── Structural Map Sample Elements Preview ──────────────────")
     for i, (sample_id, tissue_id) in enumerate(mapping.items()):
         print(f"  {sample_id} → {tissue_id}")
         if i >= 2:
             break
 
-    # Test de lookup
-    print("\n── Test get_tissue_or_unknown ────────────")
+    # Execute isolated lookup behavior testing patterns
+    print("\n── Evaluating get_tissue_or_unknown Behavior Patterns ────────────")
     test_id = "GTEX-FAKE-0000-SM-XXXXX"
     result  = get_tissue_or_unknown(mapping, test_id)
-    print(f"  sample no existente → {result}")
+    print(f"  Querying simulated invalid sample_id instance target → {result}")
 
     first_sample = next(iter(mapping))
     result2 = get_tissue_or_unknown(mapping, first_sample)
-    print(f"  primera muestra real → {result2}")
+    print(f"  Querying initial actual data sample tracking node → {result2}")
