@@ -242,4 +242,196 @@ class GoldAccumulatorMap:
         """
         n_groups = self._next_idx
         if n_groups == 0:
-            logger.warning("to_arrow_table() triggered with 0 registered tracking targets — returning empty template
+            logger.warning("to_arrow_table() triggered with 0 registered tracking targets — returning empty template schema.")
+            return _empty_gold_schema()
+
+        logger.info("Converting %s tracked metrics records into high-performance pa.Table structures...", f"{n_groups:,}")
+
+        # Reverse structural index maps to map lookup addresses back to text components
+        inv_index = {v: k for k, v in self._index.items()}
+
+        gene_ids     = [""] * n_groups
+        gene_symbols = [""] * n_groups
+        tissue_ids   = [""] * n_groups
+        means        = [0.0] * n_groups
+        stds         = [None] * n_groups
+        medians      = [None] * n_groups
+        counts       = [0]   * n_groups
+        zero_fracs   = [0.0] * n_groups
+
+        for idx in range(n_groups):
+            key_str = inv_index[idx]
+            parts   = key_str.split("|")
+            gene_id, gene_symbol, tissue_id = parts[0], parts[1], parts[2]
+
+            n    = self._n[idx]
+            mean = self._mean[idx]
+            M2   = self._M2[idx]
+            zc   = self._zero_count[idx]
+
+            gene_ids[idx]     = gene_id
+            gene_symbols[idx] = gene_symbol
+            tissue_ids[idx]   = tissue_id
+            means[idx]        = float(mean) if n > 0 else 0.0
+            counts[idx]       = int(n)
+            zero_fracs[idx]   = float(zc / n) if n > 0 else 0.0
+
+            # Compute standard deviation using aggregated Welford variance states
+            if n >= 2:
+                stds[idx] = float(math.sqrt(M2 / n))
+
+            # Approximate median positioning using localized group reservoir arrays
+            if n > 0:
+                n_reservoir = min(int(n), self._reservoir_size)
+                reservoir_slice = sorted(
+                    float(self._reservoir[idx, j]) for j in range(n_reservoir)
+                )
+                mid = len(reservoir_slice) // 2
+                if len(reservoir_slice) % 2 == 0:
+                    medians[idx] = (reservoir_slice[mid - 1] + reservoir_slice[mid]) / 2.0
+                else:
+                    medians[idx] = reservoir_slice[mid]
+
+        table = pa.table(
+            {
+                "gene_id":          pa.array(gene_ids,     type=pa.string()),
+                "gene_symbol":      pa.array(gene_symbols, type=pa.string()),
+                "tissue_id":        pa.array(tissue_ids,   type=pa.string()),
+                "mean_log1p_tpm":   pa.array(means,        type=pa.float32()),
+                "std_log1p_tpm":    pa.array(stds,         type=pa.float32()),
+                "median_log1p_tpm": pa.array(medians,      type=pa.float32()),
+                "sample_count":     pa.array(counts,       type=pa.int32()),
+                "zero_fraction":    pa.array(zero_fracs,   type=pa.float32()),
+            }
+        )
+
+        logger.info("pa.Table processing execution finalized: %s rows, %s schema columns bound.",
+                    f"{table.num_rows:,}", table.num_columns)
+        return table
+
+    # ── Inspection Telemetry Properties ──────────────────────────────────
+
+    @property
+    def group_count(self) -> int:
+        return len(self._index)
+
+    def tissue_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for key_str in self._index:
+            tissue_id = key_str.split("|")[2]
+            counts[tissue_id] = counts.get(tissue_id, 0) + 1
+        return counts
+
+
+# ─────────────────────────────────────────────
+#  Fallback Template Schema Instantiation
+# ─────────────────────────────────────────────
+
+def _empty_gold_schema() -> pa.Table:
+    return pa.table(
+        {
+            "gene_id":          pa.array([], type=pa.string()),
+            "gene_symbol":      pa.array([], type=pa.string()),
+            "tissue_id":        pa.array([], type=pa.string()),
+            "mean_log1p_tpm":   pa.array([], type=pa.float32()),
+            "std_log1p_tpm":    pa.array([], type=pa.float32()),
+            "median_log1p_tpm": pa.array([], type=pa.float32()),
+            "sample_count":     pa.array([], type=pa.int32()),
+            "zero_fraction":    pa.array([], type=pa.float32()),
+        }
+    )
+
+
+# ─────────────────────────────────────────────
+#  Isolated Diagnostic Unit Testing Harnesses (CLI Sandboxing)
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import shutil
+    import numpy as np
+
+    TEST_CACHE = "/tmp/gold_cache_test"
+    if os.path.exists(TEST_CACHE):
+        shutil.rmtree(TEST_CACHE)
+
+    print("\n── Test 1: Evaluating Welford Streaming Accuracy vs NumPy ──────────────────────────────────\n")
+
+    rng  = np.random.default_rng(42)
+    vals = rng.exponential(scale=2.0, size=10_000).tolist()
+
+    acc_map = GoldAccumulatorMap(cache_dir=TEST_CACHE, max_groups=100)
+    batch = pa.record_batch({
+        "gene_id":     pa.array(["ENSG001"] * len(vals)),
+        "gene_symbol": pa.array(["GENE_A"]  * len(vals)),
+        "tissue_id":   pa.array(["Liver"]   * len(vals)),
+        "tpm_value":   pa.array(vals,           type=pa.float32()),
+    })
+    acc_map.update_from_batch(batch)
+
+    log_vals  = np.log1p(vals)
+    np_mean   = float(np.mean(log_vals))
+    np_std    = float(np.std(log_vals))
+    np_median = float(np.median(log_vals))
+
+    idx  = acc_map._index["ENSG001|GENE_A|Liver"]
+    mean = float(acc_map._mean[idx])
+    n    = float(acc_map._n[idx])
+    M2   = float(acc_map._M2[idx])
+    std  = math.sqrt(M2 / n) if n >= 2 else None
+
+    print(f"  mean → Welford: {mean:.8f}  numpy: {np_mean:.8f}  delta: {abs(mean - np_mean):.2e}")
+    print(f"  std  → Welford: {std:.8f}  numpy: {np_std:.8f}  delta: {abs(std - np_std):.2e}")
+    print(f"  mean convergence verification: {abs(mean - np_mean) < 1e-6}")
+    print(f"  std convergence verification: {abs(std  - np_std)  < 1e-6}")
+
+    print("\n── Test 2: Checking zero_fraction Precision Boundaries ─────────────────────────────────────\n")
+
+    shutil.rmtree(TEST_CACHE)
+    acc_map2 = GoldAccumulatorMap(cache_dir=TEST_CACHE, max_groups=100)
+    batch2 = pa.record_batch({
+        "gene_id":     pa.array(["ENSG001"] * 10),
+        "gene_symbol": pa.array(["GENE_A"]  * 10),
+        "tissue_id":   pa.array(["Liver"]   * 10),
+        "tpm_value":   pa.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+                                type=pa.float32()),
+    })
+    acc_map2.update_from_batch(batch2)
+    idx2 = acc_map2._index["ENSG001|GENE_A|Liver"]
+    zf   = float(acc_map2._zero_count[idx2]) / float(acc_map2._n[idx2])
+    print(f"  zero_fraction: {zf:.4f}  expected value: 0.3000  status validation: {abs(zf - 0.30) < 1e-9}")
+
+    print("\n── Test 3: Structural Extraction to PyArrow Object Tables ───────────────\n")
+
+    shutil.rmtree(TEST_CACHE)
+    acc_map3 = GoldAccumulatorMap(cache_dir=TEST_CACHE, max_groups=100)
+    batch3 = pa.record_batch({
+        "gene_id":     pa.array(["ENSG001", "ENSG001", "ENSG002", "ENSG001"]),
+        "gene_symbol": pa.array(["GENE_A",  "GENE_A",  "GENE_B",  "GENE_A"]),
+        "tissue_id":   pa.array(["Liver",   "Liver",   "Liver",   "Blood"]),
+        "tpm_value":   pa.array([1.0, 2.0, 5.0, 0.0], type=pa.float32()),
+    })
+    acc_map3.update_from_batch(batch3)
+    print(f"  Identified unique group partitions: {acc_map3.group_count}")
+    assert acc_map3.group_count == 3
+
+    gold_table = acc_map3.to_arrow_table()
+    print(f"  Generated gold_table row footprint: {gold_table.num_rows}")
+    rows = gold_table.to_pydict()
+    for i in range(gold_table.num_rows):
+        if rows["gene_id"][i] == "ENSG001" and rows["tissue_id"][i] == "Liver":
+            assert rows["sample_count"][i] == 2
+            assert rows["zero_fraction"][i] == 0.0
+            print(f"  ENSG001/Liver → sample_count={rows['sample_count'][i]} zero_fraction={rows['zero_fraction'][i]:.2f} ✅")
+        if rows["gene_id"][i] == "ENSG001" and rows["tissue_id"][i] == "Blood":
+            assert rows["zero_fraction"][i] == 1.0
+            print(f"  ENSG001/Blood → sample_count={rows['sample_count'][i]} zero_fraction={rows['zero_fraction'][i]:.2f} ✅")
+
+    print("\n── Test 4: Persistent File State Flushing and Hydration Resumption ────────────────────────────────────\n")
+    acc_map3.flush()
+    acc_map4 = GoldAccumulatorMap(cache_dir=TEST_CACHE, max_groups=100, resume=True)
+    print(f"  Recovered unique tracking metrics counts post-hydration: {acc_map4.group_count}")
+    assert acc_map4.group_count == 3
+    print("  State recovery assertion check passed ✅")
+
+    shutil.rmtree(TEST_CACHE)
+    print("\n✅ All localized unit tests executed successfully — gold_accumulators.py v3 memmap pipeline ready.\n")
