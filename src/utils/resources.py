@@ -1,18 +1,18 @@
 """
 src/utils/resources.py
 
-Gestiona la infraestructura elástica del motor de procesamiento (Paso 3 del Framework).
-Calcula y aplica la configuración óptima de Spark basándose en:
-- Un snapshot determinista del hardware (RAM, CPUs, Plataforma).
-- El modo de ejecución (local, yarn, k8s).
-- Priorización de overrides manuales definidos en el archivo .env.
+Manages the elastic infrastructure of the processing engine (Step 3 of the Framework).
+Calculates and applies optimal Spark configurations based on:
+- A deterministic hardware snapshot (RAM, CPUs, Platform).
+- The execution deployment target mode (local, yarn, k8s).
+- Prioritization of manual overrides specified within the .env file.
 
-Garantiza la reproducibilidad mediante un sistema de 'fingerprinting' (SHA-256), 
-asegurando que cada ejecución quede registrada con un ID único de infraestructura 
-para el data lineage del AI_LOG.
+Guarantees reproducibility through an infrastructure fingerprinting system (SHA-256), 
+ensuring that every single run execution is logged with a unique infrastructure ID 
+for the AI_LOG data lineage collection tracks.
 
-Función principal: apply_to_spark_session — integra la inteligencia de recursos 
-directamente en el ciclo de vida de la SparkSession.
+Primary Entry Point: apply_to_spark_session — integrates resource intelligence 
+directly into the SparkSession initialization lifecycle loop.
 """
 import psutil
 import os
@@ -28,17 +28,17 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  Snapshot del entorno (base para reproducibilidad)
+#  Environment Snapshot (Baseline for Reproducibility)
 # ─────────────────────────────────────────────
 
 def _capture_env_snapshot() -> dict:
     """
-    Captura el estado determinista del entorno.
-    Mismo entorno → mismo snapshot → misma config.
+    Captures a deterministic state snapshot of the active environment.
+    Identical hardware state → identical snapshot → identical configuration footprint.
     """
     mem = psutil.virtual_memory()
     return {
-        "total_ram_bytes":     mem.total,
+        "total_ram_bytes":      mem.total,
         "available_ram_bytes": mem.available,
         "cpu_physical":        psutil.cpu_count(logical=False) or 1,
         "cpu_logical":         psutil.cpu_count(logical=True) or 1,
@@ -50,43 +50,44 @@ def _capture_env_snapshot() -> dict:
 
 def _snapshot_fingerprint(snapshot: dict) -> str:
     """
-    Hash SHA-256 del snapshot.
-    Fingerprint igual en dos máquinas → config idéntica.
+    Generates a SHA-256 hash marker identifying the capture snapshot.
+    Matching fingerprint across target execution run nodes → identical configuration applied.
     """
     canonical = json.dumps(snapshot, sort_keys=True)
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
 # ─────────────────────────────────────────────
-#  Validación del override
+#  Override Verification Logic
 # ─────────────────────────────────────────────
 
 def _parse_memory_override(raw: str) -> str:
-    """Valida y normaliza el override. Lanza ValueError si es inválido."""
+    """Validates and normalizes runtime configuration overrides. Raises ValueError if invalid."""
     raw = raw.strip()
     if re.fullmatch(r"\d+(\.\d+)?[gGmM]", raw):
         return raw.lower()
     raise ValueError(
-        f"SPARK_EXECUTOR_MEMORY_OVERRIDE='{raw}' inválido. "
-        "Usa formato como '4g', '2.5g' o '512m'."
+        f"Specified SPARK_EXECUTOR_MEMORY_OVERRIDE='{raw}' is invalid. "
+        "Please provide standard allocations like '4g', '2.5g', or '512m'."
     )
 
 
 # ─────────────────────────────────────────────
-#  Cálculo de memoria — función pura
+#  Memory Arithmetic Allocation Rules (Pure Function)
 # ─────────────────────────────────────────────
 
 def _calculate_memory(total_bytes: int, available_bytes: int, override_active: bool) -> float:
     """
-    Función pura: misma entrada → misma salida (idempotente).
+    Pure mathematical evaluator: matching inputs → identical outputs (Idempotent execution).
 
-    Prioridad:
-        1. override del .env — SOLO si cabe en la RAM disponible real
-        2. inferencia por total_ram × 0.60
-        3. inferencia por available_ram × 0.90 (si hay presión de memoria)
+    Priority Matrix:
+        1. .env manual declaration — Applied ONLY if it safely clears active runtime bounds
+        2. Inferred heuristics via total_ram × 0.60
+        3. Inferred heuristics via available_ram × 0.90 (Engaged when system memory is constrained)
 
-    Si el override pide más RAM de la que hay disponible, se ignora y se
-    usa la inferencia — evita OOM de JVM aunque el .env diga otra cosa.
+    If an override requests memory layout spaces that exceed the safe limits of the operational 
+    hardware footprint, it is dropped to trigger safer inference rules instead — preventing JVM OutOfMemory
+    fault conditions regardless of standard local configurations.
     """
     total_gb     = total_bytes     / (1024 ** 3)
     available_gb = available_bytes / (1024 ** 3)
@@ -97,8 +98,8 @@ def _calculate_memory(total_bytes: int, available_bytes: int, override_active: b
         recommended = min(by_total, by_available)
         if not override_active:
             logger.warning(
-                "Presión de memoria: disponible=%.1fGB < calculado=%.1fGB. "
-                "Ajustando a %.1fGB. Usa SPARK_EXECUTOR_MEMORY_OVERRIDE para fijar manualmente.",
+                "System memory pressure detected: available=%.1fGB < calculated=%.1fGB. "
+                "Throttling safety allocations back to %.1fGB. Declare SPARK_EXECUTOR_MEMORY_OVERRIDE to anchor manually.",
                 available_gb, by_total, recommended
             )
     else:
@@ -109,15 +110,16 @@ def _calculate_memory(total_bytes: int, available_bytes: int, override_active: b
 
 def _validate_override_fits(override_str: str, available_bytes: int) -> bool:
     """
-    Verifica que el override del .env cabe en la RAM disponible real.
-    Si no cabe, el override se ignora — la inferencia es más conservadora.
+    Verifies if a .env override parameter safely clears the active physical environment constraints.
+    If the bounds check fails, the override is dropped to engage standard structural inferences.
 
-    Ejemplo: override=4g, available=1.8g → False → usar inferencia
-    Ejemplo: override=2g, available=3.5g → True  → usar override
+    Execution Patterns:
+    - override=4g, available=1.8g → False → Fall back to standard calculations
+    - override=2g, available=3.5g → True  → Commit override targets
     """
     available_gb = available_bytes / (1024 ** 3)
 
-    # Parsear el override a GB
+    # Standardize and parse override mapping to GB targets
     raw = override_str.strip().lower()
     try:
         if raw.endswith("g"):
@@ -129,14 +131,14 @@ def _validate_override_fits(override_str: str, available_bytes: int) -> bool:
     except ValueError:
         return False
 
-    # El override debe dejar al menos 20% de RAM libre para el OS y otros procesos
+    # Manual allocations must reserve a minimum 20% system buffer for OS overhead and auxiliary routines
     safe_limit_gb = available_gb * 0.85
     fits = requested_gb <= safe_limit_gb
 
     if not fits:
         logger.warning(
-            "Override rechazado: .env pide %.1fgb pero solo hay %.1fgb disponibles "
-            "(limite seguro=%.1fgb). Usando inferencia para evitar OOM.",
+            "System configuration override rejected: .env rules demand %.1fgb, but only %.1fgb are available "
+            "(Operational threshold limit ceiling=%.1fgb). Defaulting back to engine inference choices to isolate OOM faults.",
             requested_gb, available_gb, safe_limit_gb
         )
 
@@ -144,11 +146,11 @@ def _validate_override_fits(override_str: str, available_bytes: int) -> bool:
 
 
 # ─────────────────────────────────────────────
-#  Builders por modo
+#  Target Deployment Configuration Builders
 # ─────────────────────────────────────────────
 
 def _build_local_config(memory_gb: float, cores: int, memory_str: str) -> dict:
-    """En local, solo driver.memory importa. executor.memory es ignorado por Spark."""
+    """Local Deployment Layer: Only driver configuration weights apply. Executor specifications are skipped by Spark."""
     usable_cores = max(cores - 1, 1)
     return {
         "spark.master":                 f"local[{usable_cores}]",
@@ -159,7 +161,7 @@ def _build_local_config(memory_gb: float, cores: int, memory_str: str) -> dict:
 
 
 def _build_yarn_config(memory_gb: float, cores: int, memory_str: str) -> dict:
-    """YARN: divide memoria entre driver y executors."""
+    """YARN Cluster Layer: Balances shared execution boundaries evenly between driver tracks and workers."""
     driver_gb    = round(max(memory_gb * 0.35, 1.0), 1)
     executor_gb  = round(max(memory_gb * 0.65, 1.0), 1)
     usable_cores = max(cores - 1, 1)
@@ -173,7 +175,7 @@ def _build_yarn_config(memory_gb: float, cores: int, memory_str: str) -> dict:
 
 
 def _build_k8s_config(memory_gb: float, cores: int, memory_str: str) -> dict:
-    """K8s: igual que YARN + overhead de contenedor (~10%)."""
+    """K8s Cloud Layer: Standard layout allocations combined with container storage padding thresholds (~10%)."""
     overhead     = round(memory_gb * 0.10, 1)
     executor_gb  = round(max(memory_gb * 0.60, 1.0), 1)
     driver_gb    = round(max(memory_gb * 0.30, 1.0), 1)
@@ -197,73 +199,73 @@ _MODE_BUILDERS = {
 
 
 # ─────────────────────────────────────────────
-#  Función principal
+#  Primary Engine Parameter Computation
 # ─────────────────────────────────────────────
 
 def get_spark_memory_settings(mode: Optional[str] = None) -> dict:
     """
-    Calcula la configuración óptima de Spark para el entorno actual.
+    Calculates the absolute optimal Spark engine configuration properties for the system context.
 
-    Idempotente:  misma entrada → mismo resultado siempre.
-    Reproducible: fingerprint SHA-256 para trazabilidad en AI_LOG y lineage.
+    Idempotent Design: Exact match parameter footprints guarantee identical output maps.
+    Reproducible Engine: Implements explicit SHA-256 fingerprint chains to bind diagnostic log state metrics.
 
     Args:
-        mode: 'local' | 'yarn' | 'k8s'. Prioridad: argumento > SPARK_MODE env > 'local'.
+        mode: 'local' | 'yarn' | 'k8s'. Resolution preference: Manual Argument > SPARK_MODE variable > 'local'.
 
     Returns:
-        dict con spark_config, meta y env_snapshot.
+        A mapping dictionary bundling spark_config entries, runtime metadata summaries, and target env snapshots.
     """
-    # 1. Snapshot determinista
+    # 1. Capture system hardware state parameters
     snapshot    = _capture_env_snapshot()
     fingerprint = _snapshot_fingerprint(snapshot)
 
-    # 2. Resolver modo
+    # 2. Resolve cluster environment tracking mode
     resolved_mode = (mode or snapshot["mode_env"] or "local").lower()
     if resolved_mode not in _MODE_BUILDERS:
         raise ValueError(
-            f"Modo '{resolved_mode}' no soportado. Usa: {list(_MODE_BUILDERS)}"
+            f"Deployment architecture model target '{resolved_mode}' is not supported. Choose among: {list(_MODE_BUILDERS)}"
         )
 
-    # 3. Resolver override — validar que cabe en RAM disponible ANTES de aplicar
+    # 3. Resolve overrides — Confirm resources exist safely BEFORE locking assignments
     override = snapshot["override_env"]
     if override:
         try:
             parsed_override = _parse_memory_override(override)
-            # Verificar que el override realmente cabe — si no, usar inferencia
+            # Assess physical infrastructure viability thresholds
             if _validate_override_fits(parsed_override, snapshot["available_ram_bytes"]):
                 memory_str       = parsed_override
                 override_applied = True
             else:
-                override_applied = False  # override rechazado, usar inferencia
+                override_applied = False  # Override fails bounds evaluation; pass back to heuristics
         except ValueError as e:
-            logger.warning("Override inválido ignorado: %s", e)
+            logger.warning("Malformed environment override configurations dropped from verification tracks: %s", e)
             override_applied = False
     else:
         override_applied = False
 
-    # 4. Calcular memoria base por inferencia
-    # override_active=False aquí siempre porque si el override fue aceptado
-    # ya tenemos memory_str y no necesitamos el warning de presión
+    # 4. Process underlying engine calculations
+    # override_active=False forces static alignment controls because verified manual parameters 
+    # already establish targeted control boundaries directly
     memory_gb = _calculate_memory(
         snapshot["total_ram_bytes"],
         snapshot["available_ram_bytes"],
         override_active=override_applied,
     )
 
-    # 5. Si override fue rechazado o no existe, usar la inferencia
-    # Convertir a MB para evitar decimales invalidos en la JVM (2.0g falla, 2048m funciona)
+    # 5. Handle fallback steps when override components fail validation limits
+    # Standardize layouts using explicit MB values to protect JVM processes from layout conversions (e.g., '2.0g' error crashes)
     if not override_applied:
         memory_mb = int(memory_gb * 1024)
         memory_str = f"{memory_mb}m"
 
-    # 6. Construir config del modo
+    # 6. Call target orchestration infrastructure generation rules
     spark_config = _MODE_BUILDERS[resolved_mode](
         memory_gb,
         snapshot["cpu_physical"],
         memory_str,
     )
 
-    # 7. Limpiar claves nulas
+    # 7. Drop empty assignment keys from the active structure mapping
     spark_config = {k: v for k, v in spark_config.items() if v is not None}
 
     return {
@@ -274,7 +276,7 @@ def get_spark_memory_settings(mode: Optional[str] = None) -> dict:
             "override_applied": override_applied,
             "memory_used":      memory_str,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "total_ram_gb":     round(snapshot["total_ram_bytes"]     / (1024 ** 3), 2),
+            "total_ram_gb":      round(snapshot["total_ram_bytes"]     / (1024 ** 3), 2),
             "available_ram_gb": round(snapshot["available_ram_bytes"] / (1024 ** 3), 2),
             "cpu_physical":     snapshot["cpu_physical"],
             "platform":         snapshot["platform"],
@@ -284,37 +286,37 @@ def get_spark_memory_settings(mode: Optional[str] = None) -> dict:
 
 
 # ─────────────────────────────────────────────
-#  Config especifica para writes pesados
+#  Heavy Production Writing Custom Strategies
 # ─────────────────────────────────────────────
 
 def get_write_config() -> dict:
     """
-    Calcula config conservadora para writes pesados (Silver → Delta, Gold → Delta).
-    Distinta de get_spark_memory_settings() que optimiza para procesamiento general.
+    Calculates safety configurations protecting massive storage flush events (Silver → Delta, Gold → Delta).
+    Differs from get_spark_memory_settings() by focusing on pipeline write stability over raw data transformation.
 
-    Estrategia:
-    - Cores: max(1, cpu_fisicos // 3) — escala con el hardware sin saturar
-      Con 6 cores → 2. Con 12 → 4. Con 2 → 1.
-    - Off-heap: 15% de la RAM disponible — alivia presión del GC de JVM
-      Con 2GB disponibles → 300MB. Con 6GB → 900MB. Max 2GB.
-    - Shuffle partitions: igual al número de cores de write × 4
-      Evita el default de 200 que genera demasiados archivos pequeños.
+    Operational Directives:
+    - System Cores: max(1, physical_cpus // 3) — Scales to hardware capacity without bottlenecking runtime loops
+      e.g., 6 physical cores → uses 2. 12 cores → uses 4. 2 cores → uses 1.
+    - Off-heap Spaces: Reserves 15% of functional RAM metrics — Alleviates performance drag across JVM GC actions
+      e.g., 2GB free allocation limits → generates 300MB. 6GB → generates 900MB. Max tracking cap fixed to 2GB.
+    - Shuffle Segments: Matches total targeted write core allocation counts × 4
+      Bypasses the generic 200 default marker to minimize tiny, fragmented file allocations.
 
     Returns:
-        dict con las config keys listas para SparkSession.builder.config()
+        Dictionary mapping tracking configuration properties ready to inject into SparkSession.builder.config()
     """
     mem          = psutil.virtual_memory()
     available_gb = mem.available / (1024 ** 3)
     cpu_physical = psutil.cpu_count(logical=False) or 1
 
-    # Cores conservadores para write — no saturar la JVM
+    # Apply conservative processing engine layouts to isolate engine resource lock scenarios
     write_cores = max(1, cpu_physical // 3)
 
-    # Off-heap — 15% del disponible, mínimo 256MB, máximo 2GB
+    # Off-heap calculations — 15% of active systems available capacity, floor tracking at 256MB, ceiling cap at 2GB
     off_heap_gb  = min(max(round(available_gb * 0.15, 1), 0.25), 2.0)
     off_heap_str = f"{int(off_heap_gb * 1024)}m" if off_heap_gb < 1 else f"{off_heap_gb}g"
 
-    # Shuffle partitions calibradas para el write, no el procesamiento general
+    # Calibration targets mapped directly around structural output limits rather than computational transforms
     shuffle_partitions = max(write_cores * 4, 10)
 
     config = {
@@ -325,8 +327,8 @@ def get_write_config() -> dict:
     }
 
     logger.info(
-        "write_config: cores=%d | off_heap=%s | shuffle_partitions=%d "
-        "(available_ram=%.1fgb, cpu_physical=%d)",
+        "write_config committed parameters: cores=%d | off_heap=%s | shuffle_partitions=%d "
+        "(System statistics baseline: available_ram=%.1fgb, cpu_physical=%d)",
         write_cores, off_heap_str, shuffle_partitions, available_gb, cpu_physical
     )
 
@@ -334,15 +336,15 @@ def get_write_config() -> dict:
 
 
 # ─────────────────────────────────────────────
-#  Helper de integración con SparkSession
+#  Orchestration Lifecycle Integration Helpers
 # ─────────────────────────────────────────────
 
 def apply_to_spark_session(builder, mode: Optional[str] = None):
     """
-    Aplica la config calculada directamente a un SparkSession.builder.
+    Injects the evaluated infrastructure tuning parameters directly back into an active SparkSession.builder pipeline.
 
-    Uso:
-        builder = SparkSession.builder.appName("mi_app")
+    Execution Blueprint:
+        builder = SparkSession.builder.appName("target_pipeline_submodule")
         spark = apply_to_spark_session(builder).getOrCreate()
     """
     result = get_spark_memory_settings(mode=mode)
@@ -352,7 +354,7 @@ def apply_to_spark_session(builder, mode: Optional[str] = None):
 
 
 # ─────────────────────────────────────────────
-#  CLI
+#  Local Integration Verification Harness (CLI Entry Point)
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -360,10 +362,10 @@ if __name__ == "__main__":
     mode_arg = sys.argv[1] if len(sys.argv) > 1 else None
     result   = get_spark_memory_settings(mode=mode_arg)
 
-    print("\n── Spark Config ──────────────────────────")
+    print("\n── Computed Spark Properties Engine Config ──────────────────────────")
     for k, v in result["spark_config"].items():
         print(f"  {k} = {v}")
 
-    print("\n── Metadata ──────────────────────────────")
+    print("\n── Trace Operational Context Metadata ──────────────────────────────")
     for k, v in result["meta"].items():
         print(f"  {k}: {v}")
