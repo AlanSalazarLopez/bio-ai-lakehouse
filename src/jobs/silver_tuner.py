@@ -204,7 +204,7 @@ def build_synthetic_sample(
             else:
                 # Log-normal distribution maps standard biometrical transcript expressions
                 values.append(float(rng.lognormvariate(1.5, 2.0)))
-            cols_data[col] = pa.array(values, type=pa.float32())
+        cols_data[col] = pa.array(values, type=pa.float32())
 
     sample_table = pa.table(cols_data)
 
