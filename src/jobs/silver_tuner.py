@@ -1,33 +1,33 @@
 """
 src/jobs/silver_tuner.py
 
-Config tuner para Phase 1 — binary search sobre cols_per_chunk.
+Config tuner for Phase 1 — binary search over cols_per_chunk parameters.
 
-Corre sobre un sample pequeño del Bronze (N filas × todas las columnas)
-para encontrar el cols_per_chunk óptimo ANTES de correr el reshape completo.
+Executes across a lightweight small Bronze data sample (N rows × all available columns)
+to capture the optimal cols_per_chunk sizing thresholds BEFORE triggering comprehensive reshape stages.
 
-Estrategia:
-    1. Arranca en cols_per_chunk = 1  (mínimo absoluto, garantizado)
-    2. Sube en potencias de 2: 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128 → ...
-    3. En cada intento: mide RAM pico real con thread monitor cada 200ms
-    4. Si RAM pico > RAM_SAFETY_THRESHOLD: para, guarda el último N que funcionó
-    5. Escribe optimal_config.json con la config ganadora
+Strategy:
+    1. Initialize sequence boundaries at cols_per_chunk = 1 (Absolute baseline minimum, safety guaranteed).
+    2. Ascend in strict powers of 2 increments: 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128 → ...
+    3. During each iteration: evaluate precise real peak RAM usage spikes utilizing a thread monitor every 200ms.
+    4. If measured peak RAM usage exceeds RAM_SAFETY_THRESHOLD bounds: halt sweep, cache final validated operational N state.
+    5. Serialize configuration outputs to optimal_config.json with active winner profile layouts.
 
-Output:
+Output Directory Artifacts:
     data/staging/silver_tuner/
-        optimal_config.json     ← Phase 1 lee esto si existe
-        tuner_log.json          ← historial completo de intentos
+        optimal_config.json      ← Read by Phase 1 workflow dynamically if discovered on launch
+        tuner_log.json           ← Complete chronological test execution attempt histories
 
-Uso:
-    docker exec -it --workdir /opt/spark/work-dir spark-master \\
+Usage Constraints:
+    docker exec -it --workdir /opt/spark/work-dir spark-master \
         env PYTHONPATH=. python3 src/jobs/silver_tuner.py
 
-    # Forzar re-tune aunque ya exista optimal_config.json:
+    # Override existing cached profiles and force fresh tuning parameter executions:
     python3 src/jobs/silver_tuner.py --force
 
-El tuner usa un sample de SAMPLE_ROWS filas — cada intento tarda segundos.
-La config ganadora se usa en el reshape completo que tarda horas.
-Se corre UNA vez por equipo. Si cambias de máquina, corre de nuevo.
+The tuner leverages a tiny test footprint restricted to SAMPLE_ROWS records — making individual passes resolve in seconds.
+The validated configuration winner applies downstream to scale full production reshape pipelines requiring hours.
+Executed ONCE per infrastructure workstation node setup. If underlying engine hardware is modified, re-run tuning tracks.
 """
 
 import argparse
@@ -44,8 +44,8 @@ import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# Usar el metadata_loader real — mismo strip(), mismo KeyError, idéntico al Phase 1.
-# Si PYTHONPATH no está seteado (ej. correr fuera del contenedor), cae al fallback inline.
+# Leverage the true system metadata_loader module — maintaining identical strip(), KeyError, and Phase 1 behavior.
+# If local PYTHONPATH structures are missing (e.g. running outside active targets), fallback gracefully inline.
 try:
     from src.utils.metadata_loader import load_tissue_mapping as _load_tissue_mapping_real
     _USE_REAL_LOADER = True
@@ -53,21 +53,21 @@ except ImportError:
     _USE_REAL_LOADER = False
 
 # ---------------------------------------------------------------------------
-# Config
+# Global Performance Configuration Parameters
 # ---------------------------------------------------------------------------
 
-BRONZE_PATH     = "data/bronze/gtex/gene_tpm_raw.parquet"
+BRONZE_PATH      = "data/bronze/gtex/gene_tpm_raw.parquet"
 METADATA_PATH   = "data/raw/gtex_metadata.txt"
-TUNER_DIR       = "data/staging/silver_tuner"
+TUNER_DIR        = "data/staging/silver_tuner"
 OPTIMAL_CONFIG  = "data/staging/silver_tuner/optimal_config.json"
 TUNER_LOG        = "data/staging/silver_tuner/tuner_log.json"
 PROFILING_REPORT = "data/lineage/profiling_report.json"
 
 METADATA_COLS   = ["Name", "Description"]
-SAMPLE_ROWS     = 200          # filas del Bronze a usar — pequeño = intentos rápidos
-MONITOR_HZ      = 0.2          # segundos entre lecturas del monitor de RAM
-RAM_SAFETY_FRAC = 0.80         # parar si RAM pico > 80% de RAM disponible al inicio
-MAX_COLS        = 500          # techo — no tiene sentido ir más allá
+SAMPLE_ROWS      = 200          # Targeted Bronze row sample slicing depths — smaller boundaries ensure fast sweeps
+MONITOR_HZ      = 0.2          # Samping latency gaps between decoupled thread RAM profile collections
+RAM_SAFETY_FRAC = 0.80         # Intercept and abort iterations if peak delta usage crosses 80% initialization availability
+MAX_COLS        = 500          # Operational capacity ceiling bounds — structural scaling loses efficiency past this mark
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,18 +77,18 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Monitor de RAM en thread separado
+# Decoupled Non-Blocking RAM Consumption Thread Monitor
 # ---------------------------------------------------------------------------
 
 class RAMMonitor:
     """
-    Thread que mide el DELTA de RAM usado respecto al baseline al momento
-    de .start(). Mide cuánto sube la RAM, no cuánto está usada en total.
+    Decoupled execution thread monitoring absolute RAM utilization DELTA limits relative to initial values
+    captured during instantiation execution calls to .start(). Measures active execution resource escalation.
 
-    Esto evita que el baseline del sistema (Docker + WSL2 + Windows) haga
-    fallar el límite antes de que el reshape haga cualquier cosa.
+    Prevents structural baseline environment footprints (Docker + WSL2 + Windows hosts) from triggering early limit trips
+    before reshape operations get processed through the execution engine.
 
-    El pico se lee con .peak_delta_mb — incremento máximo sobre el baseline.
+    Peak utilization variables are exposed via .peak_mb property calls — representing maximum observed memory deltas.
     """
     def __init__(self):
         self._stop_event  = threading.Event()
@@ -98,9 +98,9 @@ class RAMMonitor:
 
     def start(self):
         self._stop_event.clear()
-        self._baseline   = psutil.virtual_memory().used
+        self._baseline    = psutil.virtual_memory().used
         self._peak_delta = 0
-        self._thread     = threading.Thread(target=self._run, daemon=True)
+        self._thread      = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
@@ -116,12 +116,12 @@ class RAMMonitor:
 
     @property
     def peak_mb(self) -> float:
-        """Delta máximo de RAM sobre el baseline — cuánto subió el proceso."""
+        """Maximum isolated RAM utilization delta observed past initialization base metrics — maps exact job footprints."""
         return max(0, self._peak_delta) / (1024 ** 2)
 
 
 # ---------------------------------------------------------------------------
-# Datos sintéticos desde profiling_report.json — cero contacto con Bronze
+# Data Simulation Layer — Profiling Isolation Strategies
 # ---------------------------------------------------------------------------
 
 def build_synthetic_sample(
@@ -130,67 +130,67 @@ def build_synthetic_sample(
     n_cols: int,
 ) -> tuple:
     """
-    Genera una pa.Table sintética y un tissue_mapping sintético
-    100% desde profiling_report.json — sin tocar el parquet de 19k columnas.
+    Generates isolated synthetic pa.Table objects alongside corresponding mapped metadata reference frameworks
+    solely parsing insights from profiling_report.json configurations — bypasses massive 19k column Parquet lookups.
 
-    Estructura idéntica al Bronze real:
-        - Columnas "Name" y "Description" (gene metadata)
-        - n_cols columnas de samples con formato GTEX-SYNTH-{i:04d}-SM-TUNER
-        - float32 con distribución realista (51% zeros, resto positivos)
+    Emulates exact upstream Bronze table layout profiles:
+        - Meta columns mapping "Name" and "Description" fields (Gene metadata arrays).
+        - Generates n_cols sample reference attributes adhering to GTEX-SYNTH-{i:04d}-SM-TUNER structural masks.
+        - Packs floating-point arrays aligning to realistic distribution spreads (e.g. ~51% zero values, log-normal scale balances).
 
-    El tissue_mapping asigna los sample IDs sintéticos a tejidos reales
-    extraídos del profiling_report, con la misma distribución de skew.
+    Maps sample structural metadata properties directly to realistic biological tissue groupings extracted from 
+    profiling outputs, accurately preserving existing structural skew characteristics.
 
     Args:
-        profiling_path: ruta al profiling_report.json del Paso 4
-        n_rows:         filas a generar (default 200)
-        n_cols:         columnas de samples a generar (default 500)
+        profiling_path: Target operational path pointing to core Step 4 profiling_report.json artifacts.
+        n_rows: Target simulated row dimensions generated per chunk loop sequence (Default: 200).
+        n_cols: Structural volume width limit mapping distinct sample targets within evaluations (Default: 500).
 
     Returns:
-        (sample_table, sample_cols, tissue_mapping, total_real_cols)
+        Tuple sequence containing: (sample_table, sample_cols, tissue_mapping, total_real_cols, total_real_rows)
     """
     import random
 
-    log.info(f"Cargando profiling report desde: {profiling_path}")
+    log.info(f"Loading metadata profile references from destination repository: {profiling_path}")
     with open(profiling_path) as f:
         report = json.load(f)
 
     total_real_cols = report["bronze_dimensions"]["n_sample_cols"]  # 19,788
     total_real_rows = report["bronze_dimensions"]["n_rows"]          # 74,628
 
-    # ── Tejidos reales del profiling ──────────────────────────────────────────
+    # ── Parse Real Biological Tissue Distrubutions from Profiling Reports ─────
     top_tissues    = report["metadata_profile"]["top_10_tissues"]
     bottom_tissues = report["metadata_profile"]["bottom_5_tissues"]
     all_tissues    = {**top_tissues, **bottom_tissues}
     tissue_names   = list(all_tissues.keys())
 
-    # ── Sample IDs sintéticos con formato GTEx real ───────────────────────────
+    # ── Map Synthetic Sample Identifiers matching real-world GTEx standards ───
     sample_cols = [f"GTEX-SYNTH-{i:04d}-SM-TUNER" for i in range(n_cols)]
 
-    # ── Tissue mapping sintético — distribuir por tejido proporcional al skew ─
-    # Replica el skew real: Whole Blood >> Liver - Portal Tract
+    # ── Establish Synthetic Tissue Maps — Proportional Population Rules ───────
+    # Mirrors core operational data skew realities: Whole Blood >> Liver - Portal Tract
     total_weight  = sum(all_tissues.values())
     tissue_mapping = {}
     col_idx = 0
     for tissue, count in all_tissues.items():
-        # cuántas cols le tocan proporcionalmente a este tejido
+        # Evaluate localized relative density tracking values across specific targets
         n_for_tissue = max(1, round(n_cols * count / total_weight))
         for _ in range(n_for_tissue):
             if col_idx >= n_cols:
                 break
             tissue_mapping[sample_cols[col_idx]] = tissue
             col_idx += 1
-    # el resto va al tejido más grande si sobran
+    # Clean up and append residual variables to primary baseline tissue nodes
     while col_idx < n_cols:
         tissue_mapping[sample_cols[col_idx]] = tissue_names[0]
         col_idx += 1
 
-    # ── Gene IDs y symbols sintéticos ────────────────────────────────────────
+    # ── Formulate Synthetic Structural Gene Identification Arrays ─────────────
     gene_ids     = [f"ENSG{i:011d}.1" for i in range(n_rows)]
     gene_symbols = [f"GENE{i:05d}"    for i in range(n_rows)]
 
-    # ── TPM values sintéticos — 51% zeros, resto float32 positivos ───────────
-    rng = random.Random(42)  # seed fijo para reproducibilidad
+    # ── Formulate Synthetic Matrix TPM Signals — ~51% zero values, log-normal scales ───
+    rng = random.Random(42)  # Hardcoded seed enforces fully reproducible tracking results
     zero_pct = report["null_zero_profile"]["zero_pct"] / 100.0  # 0.5189
 
     cols_data = {"Name": pa.array(gene_ids, type=pa.string()),
@@ -202,41 +202,41 @@ def build_synthetic_sample(
             if rng.random() < zero_pct:
                 values.append(0.0)
             else:
-                # distribución log-normal típica de TPM
+                # Log-normal distribution maps standard biometrical transcript expressions
                 values.append(float(rng.lognormvariate(1.5, 2.0)))
-        cols_data[col] = pa.array(values, type=pa.float32())
+            cols_data[col] = pa.array(values, type=pa.float32())
 
     sample_table = pa.table(cols_data)
 
     log.info(
-        f"Sample sintético generado: {n_rows} filas × {n_cols} cols "
-        f"({len(tissue_mapping)} muestras mapeadas a {len(set(tissue_mapping.values()))} tejidos)"
+        f"Synthetic matrix evaluation model generated: {n_rows} rows × {n_cols} columns. "
+        f"({len(tissue_mapping)} distinct sample instances bound across {len(set(tissue_mapping.values()))} tissue classes)"
     )
-    log.info(f"Total cols reales del Bronze: {total_real_cols:,} (usado para estimación de tiempo)")
+    log.info(f"Discovered total upstream Bronze structural columns: {total_real_cols:,} (Leveraged for downstream execution estimates)")
 
     return sample_table, sample_cols, tissue_mapping, total_real_cols, total_real_rows
 
 # ---------------------------------------------------------------------------
-# Reshape mínimo para benchmark (sin escribir a disco)
+# Benchmark Transformation Slices (In-Memory Processing Safeguards)
 # ---------------------------------------------------------------------------
 
 def _load_tissue_mapping(path: str) -> dict:
     """
-    Delega al metadata_loader.py real si está disponible (mismo strip(),
-    mismo KeyError, comportamiento idéntico al Phase 1).
-    Fallback inline solo si el import falló — ej. correr fuera del contenedor.
+    Passes execution tasks directly to the real system metadata_loader.py asset if discovered
+    in scope (retains exact strip() lookups, KeyError tracking, and Phase 1 behavior patterns).
+    Injects inline fallback structures exclusively if tracking imports trigger exceptions (e.g. host debugging).
     """
     if _USE_REAL_LOADER:
         return _load_tissue_mapping_real(path=path)
 
-    # Fallback inline — solo si src.utils no está en PYTHONPATH
-    log.warning("metadata_loader no disponible — usando fallback inline (solo para debug)")
+    # Local fallback routes — invoked only if python execution structures omit src.utils inside active paths
+    log.warning("Primary structural metadata_loader missing from context paths — invoking localized fallback routines")
     mapping = {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             header = f.readline().rstrip("\n").split("\t")
             if "SAMPID" not in header or "SMTSD" not in header:
-                raise KeyError(f"SAMPID o SMTSD no encontrados en header: {header[:10]}")
+                raise KeyError(f"Failed to isolate required SAMPID or SMTSD components within current file headers: {header[:10]}")
             sid_idx = header.index("SAMPID")
             tid_idx = header.index("SMTSD")
             for line in f:
@@ -248,7 +248,7 @@ def _load_tissue_mapping(path: str) -> dict:
                 if sample_id and tissue_id:
                     mapping[sample_id] = tissue_id
     except Exception as e:
-        log.warning(f"Fallback tissue mapping falló: {e} — mapping vacío")
+        log.warning(f"Localized fallback tissue tracking methods triggered processing errors: {e} — Returning empty mapping dict structures")
     return mapping
 
 
@@ -259,12 +259,12 @@ def run_reshape_sample(
     cols_per_chunk: int,
 ) -> None:
     """
-    Hace el reshape wide→long sobre sample_table con el cols_per_chunk dado.
-    Replica la lógica del fix de Phase 1: una columna a la vez, sin concat,
-    con un ParquetWriter en memoria por tissue_id (usando BytesIO, sin tocar disco).
+    Executes standard wide-to-long unpivoting tasks across target sample_table instances using set cols_per_chunk metrics.
+    Replicates Phase 1 bugfix strategies: converts isolated column lines sequentially, avoiding concatenation tasks,
+    and initializing temporary in-memory ParquetWriter tracking streams (Leverages BytesIO targets, bypassing physical disk steps).
 
-    El pico de RAM aquí es: gene_ids + gene_symbols + una sola tabla de col
-    (~40MB con 200 filas, escalado a 74k filas sigue siendo bajo).
+    Peak active RAM footprint profiles here are constrained to: gene_ids + gene_symbols + single vector slices
+    (~40MB footprint scaling arrays with 200 rows; scales linearly without capacity breaches at 74k limits).
     """
     import io
 
@@ -285,7 +285,7 @@ def run_reshape_sample(
     ]
 
     for chunk in chunks:
-        # Un writer en memoria por tissue_id — replica lo que hace Phase 1 en disco
+        # Spin up temporary thread tracking buffers per tissue_id — maps real Phase 1 storage serialization logic
         writers: dict = {}
         buffers: dict = {}
 
@@ -304,7 +304,7 @@ def run_reshape_sample(
                         "sample_id":   pa.array([col] * n_genes, type=pa.string()),
                         "tpm_value":   tpm,
                     },
-                    schema=SILVER_SCHEMA_NO_TISSUE,  # nullable=False explícito
+                    schema=SILVER_SCHEMA_NO_TISSUE,  # Explicit structural nullable=False integrity checks
                 )
 
                 if tissue_id not in writers:
@@ -320,13 +320,13 @@ def run_reshape_sample(
         finally:
             for w in writers.values():
                 w.close()
-            # Liberar buffers en memoria — en Phase 1 real estos van a disco
+            # Flush isolated memory blocks — downstream Phase 1 tasks commit these tracking arrays directly to disk layers
             buffers.clear()
             writers.clear()
 
 
 # ---------------------------------------------------------------------------
-# Un intento del tuner
+# Individual Tuning Step Iteration
 # ---------------------------------------------------------------------------
 
 def attempt(
@@ -337,8 +337,8 @@ def attempt(
     ram_limit_mb: float,
 ) -> dict:
     """
-    Corre un reshape sobre el sample con cols_per_chunk dado.
-    Retorna dict con resultados del intento.
+    Fires localized reshape passes over target simulated frames applying designated cols_per_chunk variables.
+    Returns structured results dictionaries mapping specific step performance profiles.
     """
     monitor = RAMMonitor()
     t0 = time.time()
@@ -360,10 +360,10 @@ def attempt(
     elapsed = time.time() - t0
     peak_mb = monitor.peak_mb
 
-    # También falla si se pasó del límite aunque no tronó
+    # Flag records as failed if calculated processing deltas step beyond target safe boundary thresholds
     if success and peak_mb > ram_limit_mb:
         success = False
-        error_msg = f"RAM pico ({peak_mb:.0f}MB) > límite seguro ({ram_limit_mb:.0f}MB)"
+        error_msg = f"Observed Peak RAM spike ({peak_mb:.0f}MB) outgrew established infrastructure safety thresholds ({ram_limit_mb:.0f}MB)"
 
     return {
         "cols_per_chunk": cols_per_chunk,
@@ -375,7 +375,7 @@ def attempt(
 
 
 # ---------------------------------------------------------------------------
-# Estimar tiempo total del reshape completo
+# Aggregated Infrastructure Scalability Projections
 # ---------------------------------------------------------------------------
 
 def estimate_total_minutes(
@@ -386,8 +386,8 @@ def estimate_total_minutes(
     total_cols: int,
 ) -> float:
     """
-    Escala el tiempo del sample al reshape completo.
-    elapsed_sample_s / (sample_rows * sample_cols_used) * (total_rows * total_cols)
+    Scales execution performance tracking baselines from sample spaces up to full production database workloads.
+    Calculates metrics via: elapsed_sample_s / (sample_rows * sample_cols_used) * (total_rows * total_cols)
     """
     sample_work  = sample_rows * sample_cols_used
     total_work   = total_rows  * total_cols
@@ -397,7 +397,7 @@ def estimate_total_minutes(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Orchestration Loop
 # ---------------------------------------------------------------------------
 
 def main():
@@ -405,57 +405,57 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-tunear aunque ya exista optimal_config.json",
+        help="Re-tune configuration parameters even if pre-existing optimal_config.json mappings are detected",
     )
     parser.add_argument(
         "--sample-rows",
         type=int,
         default=SAMPLE_ROWS,
-        help=f"Filas del sample sintético (default: {SAMPLE_ROWS})",
+        help=f"Total target row dimensions mapped into generated mock tables (Default: {SAMPLE_ROWS})",
     )
     parser.add_argument(
         "--sample-cols",
         type=int,
         default=500,
-        help="Columnas del sample sintético (default: 500)",
+        help="Total target column dimensions mapped into generated mock tables (Default: 500)",
     )
     args = parser.parse_args()
 
     Path(TUNER_DIR).mkdir(parents=True, exist_ok=True)
 
-    # ── Ya existe config y no se forzó re-tune ──────────────────────────────
+    # ── Manage Pre-existing Profiling Configurations and Early Exits ──────────
     if Path(OPTIMAL_CONFIG).exists() and not args.force:
         with open(OPTIMAL_CONFIG) as f:
             cfg = json.load(f)
         log.info("=" * 60)
-        log.info("Config óptima ya existe — usando la guardada")
-        log.info(f"  cols_per_chunk      : {cfg['cols_per_chunk']}")
-        log.info(f"  RAM pico (sample)   : {cfg['peak_ram_mb']} MB")
-        log.info(f"  Tiempo estimado     : {cfg['estimated_minutes']:.1f} min")
-        log.info(f"  Para re-tunear      : --force")
+        log.info("Valid operational configuration discovered — extracting cached parameters")
+        log.info(f"  Target cols_per_chunk parameter value : {cfg['cols_per_chunk']}")
+        log.info(f"  Tracked Peak RAM footprint (Sample)   : {cfg['peak_ram_mb']} MB")
+        log.info(f"  Projected workflow runtime totals     : {cfg['estimated_minutes']:.1f} minutes")
+        log.info(f"  To force fresh hardware tuning sweeps : Add '--force' argument properties")
         log.info("=" * 60)
         return cfg
 
-    # ── Setup ────────────────────────────────────────────────────────────────
+    # ── Resource Monitoring Setup & Environment Profiling ─────────────────────
     log.info("=" * 60)
-    log.info("Silver Tuner — binary search sobre cols_per_chunk")
-    log.info("Modo: 100%% sintético — cero contacto con el Bronze de 19k cols")
+    log.info("Silver Tuner Engine Launch — Executing Binary Search on cols_per_chunk targets")
+    log.info("Execution Strategy: 100% Synthetic Sandbox Simulation — Bypassing 19k column Parquet file I/O locks")
     log.info("=" * 60)
 
     mem              = psutil.virtual_memory()
     available_ram_mb = mem.available / (1024 ** 2)
     total_ram_mb     = mem.total    / (1024 ** 2)
     used_ram_mb      = mem.used     / (1024 ** 2)
-    # Límite = cuánto RAM EXTRA puede consumir el reshape sobre el baseline
-    # Usamos el disponible × safety para no crashear el sistema
+    # The operational safety margin defines maximum extra consumption limits over host baselines.
+    # We evaluate available limits combined with safety fractions to prevent host OS thread lock occurrences.
     ram_limit_mb     = available_ram_mb * RAM_SAFETY_FRAC
-    log.info(f"RAM total       : {total_ram_mb:.0f} MB")
-    log.info(f"RAM usada ahora : {used_ram_mb:.0f} MB (baseline del sistema)")
-    log.info(f"RAM disponible  : {available_ram_mb:.0f} MB")
-    log.info(f"Límite delta    : {ram_limit_mb:.0f} MB extra que puede usar el reshape ({RAM_SAFETY_FRAC*100:.0f}% del disponible)")
+    log.info(f"Total hardware memory footprint  : {total_ram_mb:.0f} MB")
+    log.info(f"Host base memory footprint usage : {used_ram_mb:.0f} MB (Current baseline system limits)")
+    log.info(f"Active available memory space    : {available_ram_mb:.0f} MB")
+    log.info(f"Safe Delta capacity boundary     : {ram_limit_mb:.0f} maximum extra MB allocatable to reshape operations ({RAM_SAFETY_FRAC*100:.0f}% of total available)")
 
-    # ── Generar sample sintético desde profiling_report.json ─────────────────
-    # Sin tocar el parquet Bronze — cero riesgo de crash en el setup
+    # ── Materialize Test Data Structures from profiling_report.json ───────────
+    # Safely isolates workloads from heavy Bronze files — removes early runtime OOM risks
     n_rows      = args.sample_rows
     n_cols      = args.sample_cols
     sample_table, sample_cols, tissue_mapping, total_cols, total_rows = build_synthetic_sample(
@@ -464,48 +464,48 @@ def main():
         n_cols         = n_cols,
     )
 
-    # ── Binary search ascendente ─────────────────────────────────────────────
+    # ── Execute Ascending Binary Step Search Tracks ───────────────────────────
     log.info("-" * 60)
-    log.info("Iniciando binary search...")
-    log.info("  Secuencia: 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128 → ...")
+    log.info("Launching ascending power binary parameter optimization sweeps...")
+    log.info("  Sequence Pattern: 1 → 2 → 4 → 8 → 16 → 32 → 64 → 128 → ...")
     log.info("-" * 60)
 
     results    = []
-    best       = None          # último intento exitoso
+    best       = None          # Caches metadata from the last fully validated functional iteration
     candidates = []
 
-    # Generar secuencia de potencias de 2 hasta MAX_COLS
+    # Map candidate parameter steps across target powers of two below global ceilings
     n = 1
     while n <= MAX_COLS:
         candidates.append(n)
         n *= 2
 
     for cols in candidates:
-        log.info(f"Intentando cols_per_chunk = {cols}...")
+        log.info(f"Evaluating execution efficiency with target cols_per_chunk set to: {cols}...")
         result = attempt(sample_table, sample_cols, tissue_mapping, cols, ram_limit_mb)
         results.append(result)
 
         status = "✅ OK" if result["success"] else "❌ FAIL"
         log.info(
-            f"  {status} | RAM pico: {result['peak_ram_mb']:.0f}MB "
-            f"| tiempo: {result['elapsed_s']:.2f}s "
-            f"| {'error: ' + result['error'] if result['error'] else ''}"
+            f"  Status: {status} | Measured Peak RAM: {result['peak_ram_mb']:.0f} MB "
+            f"| Phase Duration: {result['elapsed_s']:.2f}s "
+            f"| {'' if not result['error'] else 'Trace Error: ' + result['error']}"
         )
 
         if result["success"]:
             best = result
         else:
-            log.info(f"  → Límite encontrado en cols_per_chunk = {cols}")
-            log.info(f"  → Config óptima: cols_per_chunk = {best['cols_per_chunk'] if best else 1}")
+            log.info(f"  → Hardware resource exhaustion limit intersected at cols_per_chunk = {cols}")
+            log.info(f"  → Optimal processing parameter established: cols_per_chunk = {best['cols_per_chunk'] if best else 1}")
             break
 
-    # Si todos pasaron, el ganador es el más grande probado
+    # Fallback to absolute base settings if environment variables crash initial steps
     if best is None:
-        log.warning("Incluso cols_per_chunk=1 falló — hay un problema de entorno")
+        log.warning("Even minimal baseline profiles (cols_per_chunk=1) triggered execution failures — inspect host configurations")
         best = {"cols_per_chunk": 1, "peak_ram_mb": 0, "elapsed_s": 0}
 
-    # ── Estimar tiempo total ──────────────────────────────────────────────────
-    # total_rows y total_cols vienen del profiling_report (74,628 y 19,788)
+    # ── Project Downstream Scaled Processing Footprints ───────────────────────
+    # total_rows and total_cols are mapped from upstream profiling reports (74,628 and 19,788)
     est_minutes = estimate_total_minutes(
         elapsed_sample_s  = best["elapsed_s"],
         sample_rows       = n_rows,
@@ -514,7 +514,7 @@ def main():
         total_cols        = total_cols,
     )
 
-    # ── Guardar resultados ────────────────────────────────────────────────────
+    # ── Serialize Optimized Pipeline Parameter Targets ────────────────────────
     optimal = {
         "cols_per_chunk":      best["cols_per_chunk"],
         "peak_ram_mb":         best["peak_ram_mb"],
@@ -534,17 +534,17 @@ def main():
     with open(TUNER_LOG, "w") as f:
         json.dump({"attempts": results, "optimal": optimal}, f, indent=2)
 
-    # ── Resumen ───────────────────────────────────────────────────────────────
+    # ── Performance Tracking Summary Report Logs ──────────────────────────────
+    print("=" * 60)
+    log.info("HARDWARE OPTIMIZATION TUNER SUMMARY REPORT")
+    log.info(f"  Optimal cols_per_chunk value  : {optimal['cols_per_chunk']}")
+    log.info(f"  Peak simulation RAM footprint : {optimal['peak_ram_mb']:.0f} MB")
+    log.info(f"  Projected operational runtime : {optimal['estimated_minutes']:.1f} total minutes")
+    log.info(f"  Configuration output saved to : {OPTIMAL_CONFIG}")
     log.info("=" * 60)
-    log.info("RESULTADO DEL TUNER")
-    log.info(f"  cols_per_chunk óptimo : {optimal['cols_per_chunk']}")
-    log.info(f"  RAM pico (sample)     : {optimal['peak_ram_mb']:.0f} MB")
-    log.info(f"  Tiempo estimado total : {optimal['estimated_minutes']:.1f} min")
-    log.info(f"  Config guardada en    : {OPTIMAL_CONFIG}")
-    log.info("=" * 60)
-    log.info("Siguiente paso:")
+    log.info("Next steps in processing sequence:")
     log.info("  python3 src/jobs/silver_phase1_reshape.py")
-    log.info("  (Phase 1 leerá optimal_config.json automáticamente)")
+    log.info("  (Phase 1 pipelines import optimal_config.json variables automatically on startup)")
     log.info("=" * 60)
 
     return optimal
@@ -554,6 +554,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        log.critical("Error no manejado en silver_tuner.py")
+        log.critical("An unhandled system exception event forced early termination of silver_tuner.py")
         traceback.print_exc()
         raise SystemExit(2)
