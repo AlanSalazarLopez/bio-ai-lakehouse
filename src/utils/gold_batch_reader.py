@@ -1,26 +1,26 @@
 """
 src/utils/gold_batch_reader.py
 
-Lectura de Silver en batches para Gold — sin DeltaTable, sin Spark.
+Streaming Silver-tier layer parsing in batches for Gold processing — engine-agnostic, zero-Spark.
 
-Problema: Silver tiene 3,800 archivos Parquet y 1.5B filas. Leer todo
-en RAM es imposible con 2-3GB disponibles.
+Problem: Silver layer consists of ~3,800 Parquet partitions totaling 1.5B rows. 
+Loading this scale completely into RAM is impossible with only 2-3GB available system ceilings.
 
-Solución: generador que yield RecordBatches uno a la vez. El caller
-(gold_transform.py) procesa cada batch y lo descarta — RAM máxima
-usada es un solo batch en memoria a la vez.
+Solution: A generator pipeline that yields individual PyArrow RecordBatches sequentially. 
+The caller wrapper (gold_transform.py) consumes and drops each isolated batch, locking down the 
+maximum live active memory allocation footprint to a single batch at any given point in time.
 
-Estrategia de batch_size dinámico:
-    - psutil mide RAM disponible antes de cada archivo
-    - batch_size se recalcula si la RAM cambió significativamente
-    - Nunca hardcodea filas — se adapta al entorno real
+Dynamic Batch-Size Strategy:
+    - psutil monitors available hardware memory maps immediately before evaluating each file partition.
+    - batch_size recalculates if the available resource context shifts past established thresholds.
+    - Eliminates hardcoded row limits — self-adjusts seamlessly to real-world environments.
 
-Compatibilidad:
-    - Lee con pq.ParquetFile().iter_batches() — igual que Silver Phase 2
-    - Excluye _delta_log automáticamente
-    - Compatible con Python 3.8 (Optional[X], no X | None)
+Compatibility:
+    - Reads chunks via pq.ParquetFile().iter_batches() — mirrors Silver Phase 2 execution modes.
+    - Automatically filters out internal engine metadata paths like _delta_log.
+    - Strict Python 3.8 typing adherence (Optional[X] used over PEP 604 X | None notation).
 
-Uso típico en gold_transform.py:
+Standard Deployment Example inside gold_transform.py:
     reader = SilverBatchReader(silver_root="data/silver/gtex/gene_expression_long")
     for batch in reader.iter_batches():
         acc_map.update_from_batch(batch)
@@ -36,42 +36,42 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
-# Columnas que Gold necesita — no leer sample_id (ahorra ~20% RAM por batch)
+# Column targets required by Gold aggregation — leaves out sample_id (saves ~20% batch memory space)
 GOLD_COLUMNS = ["gene_id", "gene_symbol", "tissue_id", "tpm_value"]
 
-# Límites de seguridad para batch_size
+# Boundary safety constraints managing batch row thresholds
 MIN_BATCH_ROWS = 10_000
 MAX_BATCH_ROWS = 500_000
 
-# Fracción de RAM disponible que puede usar un batch
-RAM_BATCH_FRACTION = 0.15  # 15% — conservador, deja margen para acumuladores
+# Available memory resource fraction allocated per processing iteration step
+RAM_BATCH_FRACTION = 0.15  # 15% — defensive threshold leaving safe overhead for data storage matrices
 
-# Bytes estimados por fila de Silver en RAM (4 strings + 1 float32 ≈ ~200 bytes)
+# Calculated runtime byte usage allocation estimate per row (4 strings + 1 float32 ≈ ~200 bytes)
 BYTES_PER_ROW_ESTIMATE = 200
 
 
 # ─────────────────────────────────────────────
-#  Cálculo dinámico de batch_size — función pura
+#  Dynamic Batch-Size Computations — Pure Function
 # ─────────────────────────────────────────────
 
 def calculate_batch_size(available_ram_bytes: Optional[int] = None) -> int:
     """
-    Calcula el número de filas por batch basado en RAM disponible.
+    Computes optimal target chunk row allocations relative to currently available system memory maps.
 
     Args:
-        available_ram_bytes: RAM disponible en bytes.
-                             Si None, se mide con psutil en el momento.
+        available_ram_bytes: Physical system available memory capacity slice in bytes.
+                             If None, queries real-time resource indicators using psutil.
 
     Returns:
-        Número de filas por batch, clampado entre MIN y MAX.
+        Optimized target size value clamped safely between MIN_BATCH_ROWS and MAX_BATCH_ROWS limits.
 
-    Ejemplo con 2GB disponibles:
+    Example context with 2GB available system memory:
         budget = 2GB × 0.15 = 307MB
-        rows   = 307MB / 200 bytes = ~1,535,000 → clamp → 500,000
+        rows   = 307MB / 200 bytes = ~1,535,000 → clamped value → 500,000
 
-    Ejemplo con 512MB disponibles:
+    Example context with 512MB available system memory:
         budget = 512MB × 0.15 = 76MB
-        rows   = 76MB / 200 bytes = ~380,000 → clamp → 380,000
+        rows   = 76MB / 200 bytes = ~380,000 → clamped value → 380,000
     """
     if available_ram_bytes is None:
         available_ram_bytes = psutil.virtual_memory().available
@@ -82,7 +82,7 @@ def calculate_batch_size(available_ram_bytes: Optional[int] = None) -> int:
     batch_size = max(MIN_BATCH_ROWS, min(raw_rows, MAX_BATCH_ROWS))
 
     logger.debug(
-        "batch_size calculado: %s filas (ram_disponible=%.1fGB, budget=%.0fMB)",
+        "Calculated batch_size: %s rows (available_ram=%.1fGB, system_budget=%.0fMB)",
         f"{batch_size:,}",
         available_ram_bytes / (1024 ** 3),
         budget_bytes / (1024 ** 2),
@@ -92,28 +92,28 @@ def calculate_batch_size(available_ram_bytes: Optional[int] = None) -> int:
 
 
 # ─────────────────────────────────────────────
-#  Descubrimiento de archivos Silver
+#  Silver Storage Location Discovery
 # ─────────────────────────────────────────────
 
 def discover_silver_files(silver_root: str) -> List[pathlib.Path]:
     """
-    Encuentra todos los Parquet de Silver excluyendo _delta_log.
+    Scans, extracts, and compiles all valid Parquet files while bypassing metadata logs (_delta_log).
 
     Args:
-        silver_root: ruta raíz de Silver Delta Lake
+        silver_root: Root file path target representing the Silver Delta Lake location.
 
     Returns:
-        Lista de paths ordenada — orden determinista para reproducibilidad.
+        Sorted array of file system path points, providing deterministic ordering for workflow tracing.
 
     Raises:
-        FileNotFoundError: si silver_root no existe
-        RuntimeError: si no encuentra ningún Parquet
+        FileNotFoundError: Triggered if the targeted entry directory path is invalid.
+        RuntimeError: Triggered if discovery steps yield zero data targets.
     """
     root = pathlib.Path(silver_root)
     if not root.exists():
         raise FileNotFoundError(
-            f"Silver root no encontrado: {silver_root}\n"
-            "¿Corriste silver_phase2_delta.py primero?"
+            f"Target Silver storage path location not found: {silver_root}\n"
+            "Verify that silver_phase2_delta.py was successfully completed first."
         )
 
     files = sorted([
@@ -123,29 +123,29 @@ def discover_silver_files(silver_root: str) -> List[pathlib.Path]:
 
     if not files:
         raise RuntimeError(
-            f"No se encontraron archivos Parquet en {silver_root}\n"
-            "Silver puede estar vacío o corrupto."
+            f"No valid Parquet files recovered under the target path context: {silver_root}\n"
+            "The Silver partition might be completely un-allocated or corrupt."
         )
 
-    logger.info("Silver: %s archivos Parquet encontrados en %s", f"{len(files):,}", silver_root)
+    logger.info("Silver Layer Discovery: Found %s valid Parquet file units at location: %s", f"{len(files):,}", silver_root)
     return files
 
 
 # ─────────────────────────────────────────────
-#  Reader principal
+#  Silver Batch Stream Interface
 # ─────────────────────────────────────────────
 
 class SilverBatchReader:
     """
-    Generador de RecordBatches de Silver para Gold.
+    Streaming generator engine yielding sequential PyArrow RecordBatches from Silver to Gold pipelines.
 
-    Lee archivo por archivo, batch por batch.
-    RAM máxima: un solo batch en memoria a la vez.
+    Processes targets systematically across data splits.
+    Maximum execution memory floor: restricts live allocations to a single batch in RAM at any given moment.
 
-    Atributos públicos post-iteración:
-        files_processed  : archivos leídos
-        batches_yielded  : batches emitidos al caller
-        rows_yielded     : filas totales emitidas
+    Post-Iteration Metric Telemetry Fields:
+        files_processed  : Total distinct file units processed.
+        batches_yielded  : Cumulative batch elements dispatched to the caller runtime loop.
+        rows_yielded     : Unified row volume extracted and transmitted.
     """
 
     def __init__(
@@ -155,19 +155,19 @@ class SilverBatchReader:
     ) -> None:
         """
         Args:
-            silver_root: ruta raíz de Silver Delta Lake
-            columns:     columnas a leer. Default: GOLD_COLUMNS
-                         (excluye sample_id que Gold no necesita)
+            silver_root: Root file path target representing the Silver Delta Lake location.
+            columns:     Target field arrays to extract. Default fallback layout: GOLD_COLUMNS
+                         (implicitly bypasses sample_id references to conserve memory context overhead).
         """
         self.silver_root = silver_root
         self.columns     = columns or GOLD_COLUMNS
 
-        # Métricas — disponibles después de iter_batches()
+        # Metric tracking blocks — populated completely at termination of iter_batches() execution
         self.files_processed: int = 0
         self.batches_yielded: int = 0
         self.rows_yielded:    int = 0
 
-        # Descubrir archivos en construcción — falla rápido si Silver no existe
+        # Scan and verify entry files during execution setup — exits fast if directory routes are broken
         self._files = discover_silver_files(silver_root)
 
     @property
@@ -176,46 +176,46 @@ class SilverBatchReader:
 
     def iter_batches(self) -> Generator[pa.RecordBatch, None, None]:
         """
-        Generador principal. Yield RecordBatch uno a la vez.
+        Primary engine generator stream loop. Delivers a sequential, isolated pa.RecordBatch element at each iteration step.
 
-        Recalcula batch_size cada 100 archivos para adaptarse a cambios
-        de RAM (otros procesos, GC del acumulador).
+        Automatically triggers batch optimization updates every 100 partitions to safely dynamically adapt to 
+        shifting environment states (e.g., competing workflows, accumulation layer memory shifts).
 
-        Uso:
+        Usage Pattern:
             for batch in reader.iter_batches():
                 acc_map.update_from_batch(batch)
         """
-        # Reset métricas al inicio de cada iteración
+        # Re-initialize evaluation metric fields before executing a sequence tracking loop pass
         self.files_processed = 0
         self.batches_yielded = 0
         self.rows_yielded    = 0
 
         batch_size   = calculate_batch_size()
-        recalc_every = 100  # recalcular RAM cada N archivos
+        recalc_every = 100  # Evaluate system resource metrics every N files processed
 
         logger.info(
-            "Iniciando lectura Silver: %s archivos, batch_size=%s filas, cols=%s",
+            "Launching streaming pipeline across Silver blocks: %s files identified, targeting baseline batch_size=%s rows, columns=%s",
             f"{self.total_files:,}", f"{batch_size:,}", self.columns,
         )
 
         for file_idx, parquet_path in enumerate(self._files):
 
-            # Recalcular batch_size periódicamente
+            # Periodic batch volume boundary adjustments based on system memory changes
             if file_idx > 0 and file_idx % recalc_every == 0:
                 new_batch_size = calculate_batch_size()
                 if new_batch_size != batch_size:
                     logger.info(
-                        "batch_size ajustado: %s → %s (archivo %s/%s)",
+                        "Recalibrated batch_size parameters dynamically adjusted: %s → %s (File index position: %s/%s)",
                         f"{batch_size:,}", f"{new_batch_size:,}",
                         f"{file_idx:,}", f"{self.total_files:,}",
                     )
                     batch_size = new_batch_size
 
-            # Log de progreso cada 500 archivos
+            # Issue progress metrics at 500 file operational steps
             if file_idx % 500 == 0 and file_idx > 0:
                 pct = file_idx / self.total_files * 100
                 logger.info(
-                    "Progreso: %s/%s archivos (%.1f%%) — %s filas emitidas",
+                    "Pipeline Progress Status: %s/%s files parsed (%.1f%% complete) — %s rows successfully dispatched.",
                     f"{file_idx:,}", f"{self.total_files:,}",
                     pct, f"{self.rows_yielded:,}",
                 )
@@ -231,23 +231,23 @@ class SilverBatchReader:
                     yield batch
 
             except Exception as e:
-                # Log y continuar — un archivo corrupto no detiene Gold
+                # Catch, log anomalies, and preserve operational state — an isolated corrupted batch block must not halt the pipeline
                 logger.warning(
-                    "Archivo saltado por error: %s — %s", parquet_path, e
+                    "Bypassing defective file block structure to avoid pipeline halt: %s — Reason: %s", parquet_path, e
                 )
                 continue
 
             self.files_processed += 1
 
         logger.info(
-            "Lectura completa: %s archivos, %s batches, %s filas",
+            "Streaming extraction sequence successfully finalized: %s files handled, %s batches packed, %s cumulative rows dispatched.",
             f"{self.files_processed:,}",
             f"{self.batches_yielded:,}",
             f"{self.rows_yielded:,}",
         )
 
     def summary(self) -> str:
-        """Resumen legible post-iteración para el lineage."""
+        """Returns structured string summaries tracking operational lineage metrics."""
         return (
             f"files={self.files_processed:,} "
             f"batches={self.batches_yielded:,} "
@@ -257,67 +257,67 @@ class SilverBatchReader:
 
 
 # ─────────────────────────────────────────────
-#  CLI — smoke test sin Silver real
+#  Isolated Validation Harness Sandbox Testing (CLI Execution Target)
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
 
-    print("\n── Test 1: calculate_batch_size ──────────────────────────────\n")
+    print("\n── Test 1: Testing calculate_batch_size Boundary Logic ──────────────────────────────\n")
 
-    # Simular diferentes RAMs disponibles
-    casos = [
+    # Simulate hypothetical RAM volume shifts
+    test_cases = [
         512  * 1024 ** 2,   # 512 MB
         1    * 1024 ** 3,   # 1 GB
-        2    * 1024 ** 3,   # 2 GB  ← entorno real
+        2    * 1024 ** 3,   # 2 GB  ← Target operational environment baseline context
         8    * 1024 ** 3,   # 8 GB
     ]
-    for ram in casos:
+    for ram in test_cases:
         bs = calculate_batch_size(ram)
-        print(f"  RAM={ram / 1024**3:.1f}GB → batch_size={bs:,}")
+        print(f"  Simulated RAM availability={ram / 1024**3:.1f}GB → Derived batch_size allocation blueprint={bs:,}")
 
-    print("\n── Test 2: batch_size con RAM real ───────────────────────────\n")
+    print("\n── Test 2: Evaluating batch_size Real-Time Hardware Profile ───────────────────────────\n")
     bs_real = calculate_batch_size()
     ram_gb  = psutil.virtual_memory().available / 1024 ** 3
-    print(f"  RAM disponible ahora : {ram_gb:.2f} GB")
-    print(f"  batch_size calculado : {bs_real:,} filas")
-    print(f"  dentro de límites    : {MIN_BATCH_ROWS <= bs_real <= MAX_BATCH_ROWS}")
+    print(f"  Live environment reported available RAM capacity: {ram_gb:.2f} GB")
+    print(f"  Computed runtime loop targeted batch_size matrix ceiling: {bs_real:,} rows")
+    print(f"  Verifying boundary limit integrity constraints: {MIN_BATCH_ROWS <= bs_real <= MAX_BATCH_ROWS}")
 
-    print("\n── Test 3: discover_silver_files (Silver real) ───────────────\n")
+    print("\n── Test 3: Checking discover_silver_files Path Extraction Performance ───────────────\n")
     silver_path = "data/silver/gtex/gene_expression_long"
     try:
         files = discover_silver_files(silver_path)
-        print(f"  Archivos encontrados : {len(files):,}")
-        print(f"  Primero              : {files[0].name}")
-        print(f"  Último               : {files[-1].name}")
-        print(f"  _delta_log excluido  : {not any('_delta_log' in str(f) for f in files)}")
+        print(f"  Recovered target data files matching criteria: {len(files):,}")
+        print(f"  First partition block identified: {files[0].name}")
+        print(f"  Final partition block identified: {files[-1].name}")
+        print(f"  Confirming complete isolation of internal engine metadata blocks (_delta_log verification): {not any('_delta_log' in str(f) for f in files)}")
     except FileNotFoundError as e:
-        print(f"  Silver no disponible en este entorno — OK para CI")
-        print(f"  ({e})")
+        print(f"  Silver directory tracks absent from current local environment profiling context — skipping execution step (Standard fallback path behavior for remote CI runners).")
+        print(f"  Error structural layout detail logging: ({e})")
         sys.exit(0)
 
-    print("\n── Test 4: iter_batches (primeros 3 archivos) ────────────────\n")
+    print("\n── Test 4: Profiling iter_batches Sequence Streams (Constrained file slice evaluation) ────────────────\n")
     reader  = SilverBatchReader(silver_path)
     batches = 0
     rows    = 0
 
-    # Parchear _files para leer solo 3
+    # Overwrite internal array tracks with a limited 3-file target slice to run unit evaluation passes safely
     reader._files = reader._files[:3]
 
     for batch in reader.iter_batches():
         batches += 1
         rows    += batch.num_rows
-        # Verificar schema en el primer batch
+        # Extract and verify the structural blueprint attributes inside the first generated chunk
         if batches == 1:
             cols = batch.schema.names
-            print(f"  Columnas del batch   : {cols}")
-            assert "gene_id"    in cols, "❌ gene_id ausente"
-            assert "tpm_value"  in cols, "❌ tpm_value ausente"
-            assert "sample_id" not in cols, "❌ sample_id debería estar excluido"
-            print(f"  sample_id excluido   : ✅")
+            print(f"  Extracted active schema fields layout from batch tracking instance: {cols}")
+            assert "gene_id"    in cols, "❌ Structural extraction failure: gene_id absent from schema fields."
+            assert "tpm_value"  in cols, "❌ Structural extraction failure: tpm_value absent from schema fields."
+            assert "sample_id" not in cols, "❌ Structural constraint failure: sample_id field should have been skipped."
+            print(f"  sample_id tracking isolation verified: ✅")
 
-    print(f"  Batches emitidos     : {batches}")
-    print(f"  Filas totales        : {rows:,}")
-    print(f"  files_processed      : {reader.files_processed}")
-    print(f"  summary()            : {reader.summary()}")
-    print(f"\n✅ gold_batch_reader.py listo\n")
+    print(f"  Cumulative array batch tracking units yielded: {batches}")
+    print(f"  Integrated matrix line items counted: {rows:,}")
+    print(f"  Telemetries reported for processed file records: {reader.files_processed}")
+    print(f"  Constructed lineage block verification tracker summary: {reader.summary()}")
+    print(f"\n✅ Pipeline layer components validated — gold_batch_reader.py operational workflow configurations complete.\n")
