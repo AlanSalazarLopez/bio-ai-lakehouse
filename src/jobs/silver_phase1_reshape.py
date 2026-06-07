@@ -1,14 +1,14 @@
 """
 src/jobs/silver_phase1_reshape.py
 
-Phase 1 del reshape Silver — PyArrow puro, sin Spark, sin JVM.
+Silver Reshape Phase 1 — Pure PyArrow, no Spark, no JVM overhead.
 
-Lee el parquet Bronze wide por batches de columnas usando PyArrow Dataset API,
-hace el reshape wide→long manualmente a nivel de RecordBatch, hace el join con
-tissue_mapping, y escribe Parquet staging particionado por tissue_id en disco.
+Reads the Bronze wide Parquet file by column batches using the PyArrow Dataset API,
+manually performs the wide→long reshape at the RecordBatch level, applies the join with
+tissue_mapping, and writes a partitioned Parquet staging area sorted by tissue_id to disk.
 
-Sin Spark → sin JVM → RAM máxima usada: ~200MB por batch.
-El staging se conserva en disco como backup — Phase 2 lo consume para Delta.
+No Spark → No JVM overhead → Peak RAM utilization: ~200MB per batch.
+Staging data is retained on disk as a backup — Phase 2 consumes it to write to Delta Lake.
 
 Output:
     data/staging/silver/
@@ -18,9 +18,9 @@ Output:
         tissue_id=Liver/
             ...
         quarantine/
-            unmatched.parquet   ← samples sin tissue match
+            unmatched.parquet   ← samples without a valid tissue match
 
-Invariantes:
+Invariants:
     silver_rows + quarantine_rows == 74,628 × 19,788
 """
 
@@ -39,7 +39,7 @@ from src.utils.execution_profile import ExecutionProfile, detect_profile, get_pr
 from src.utils.lineage import load_bronze_lineage, save_lineage, SILVER_LINEAGE_PATH
 
 # ---------------------------------------------------------------------------
-# Config
+# Configuration
 # ---------------------------------------------------------------------------
 
 BRONZE_PATH   = "data/bronze/gtex/gene_tpm_raw.parquet"
@@ -49,7 +49,7 @@ METADATA_PATH = "data/raw/gtex_metadata.txt"
 
 METADATA_COLS = ["Name", "Description"]
 
-# Schema Arrow del output long
+# Output Arrow schema for long format
 SILVER_SCHEMA_ARROW = pa.schema([
     pa.field("gene_id",     pa.string(),  nullable=False),
     pa.field("gene_symbol", pa.string(),  nullable=False),
@@ -74,22 +74,22 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 1. Obtener columnas de muestras del schema (cero RAM)
+# 1. Retrieve sample columns from schema (Zero RAM footprint)
 # ---------------------------------------------------------------------------
 
 def get_sample_cols() -> List[str]:
-    """Lee solo el schema del parquet — sin datos, cero RAM."""
+    """Reads only the Parquet schema metadata — no data parsed, zero RAM overhead."""
     schema = pq.read_schema(BRONZE_PATH)
     sample_cols = [c for c in schema.names if c not in METADATA_COLS]
     log.info(
-        f"Schema Bronze: {len(schema.names)} columnas totales, "
-        f"{len(sample_cols)} columnas de muestras"
+        f"Bronze Schema metadata parsed: {len(schema.names)} total columns detected, "
+        f"{len(sample_cols)} identified as target sample columns"
     )
     return sample_cols
 
 
 # ---------------------------------------------------------------------------
-# 2. Reshape wide→long + escritura streaming (sin acumulación en RAM)
+# 2. Wide→Long Reshape + Streaming Write (Zero accumulation in RAM)
 # ---------------------------------------------------------------------------
 
 SILVER_SCHEMA_NO_TISSUE = pa.schema([
@@ -106,15 +106,15 @@ def reshape_and_write_streaming(
     batch_idx: int,
 ) -> Tuple[int, int]:
     """
-    Reshape wide→long columna por columna, escribiendo a disco inmediatamente.
-    Sin concat acumulativo — RAM máxima: una sola columna en memoria (~6MB).
+    Performs wide→long reshape column by column, streaming data directly to disk.
+    No cumulative concat operations — Peak RAM capped at a single column in memory (~6MB).
 
-    Estrategia:
-        - Un ParquetWriter abierto por tissue_id (reutilizado entre columnas)
-        - Cada columna se procesa, escribe y libera antes de la siguiente
-        - Quarantine se acumula solo si hay unmatched (debería ser vacío o mínimo)
+    Strategy:
+        - Maintains one active open ParquetWriter per tissue_id (reused across columns)
+        - Each column data array is processed, written, and garbage-collected before the next
+        - Quarantine records accumulate only on unmatched metrics (expected to be minimal/empty)
 
-    Retorna (matched_rows, quarantine_rows).
+    Returns (matched_rows, quarantine_rows).
     """
     gene_ids     = table.column("Name")
     gene_symbols = table.column("Description")
@@ -145,23 +145,23 @@ def reshape_and_write_streaming(
                 )
 
                 if tissue_id not in writers:
-                    # Crear subdirectorio y writer para este tejido
+                    # Create subdirectory structure and target writer instance for this specific tissue
                     tissue_dir = staging_dir / f"tissue_id={tissue_id}"
                     tissue_dir.mkdir(parents=True, exist_ok=True)
                     out_path = tissue_dir / f"batch_{batch_idx:04d}.parquet"
 
-                    # Idempotencia: si el archivo ya existe, verificar integridad
-                    # Archivo íntegro → saltar este tissue en este batch
-                    # Archivo corrupto → borrar y reescribir
+                    # Idempotency check: if the asset already exists, evaluate file integrity
+                    # Structurally intact file → Skip processing this tissue in the current batch
+                    # Corrupted asset → Wipe from filesystem and trigger rewrite execution
                     if out_path.exists():
                         try:
-                            pq.read_metadata(str(out_path))  # solo lee footer, cero RAM
-                            log.info(f"  Batch {batch_idx} tissue={tissue_id} ya existe y es íntegro — saltando")
-                            matched_rows += n_genes  # contar las filas aunque no se reescriban
+                            pq.read_metadata(str(out_path))  # Parsers file footer metadata only, zero RAM
+                            log.info(f"  Batch {batch_idx} tissue={tissue_id} already exists and is intact — skipping execution")
+                            matched_rows += n_genes  # Account for rows even when skipping the write stage
                             del single, tpm_values
                             continue
                         except Exception:
-                            log.warning(f"  Batch {batch_idx} tissue={tissue_id} corrupto — reescribiendo")
+                            log.warning(f"  Batch {batch_idx} tissue={tissue_id} found corrupted — unlinking asset for rewrite")
                             out_path.unlink()
 
                     writers[tissue_id] = pq.ParquetWriter(
@@ -175,7 +175,7 @@ def reshape_and_write_streaming(
                 del single
 
             else:
-                # Quarantine — acumular solo unmatched (mínimos o cero)
+                # Quarantine handler — safely isolates unmatched column keys
                 quarantine_batches.append(pa.table(
                     {
                         "gene_id":     gene_ids,
@@ -191,11 +191,11 @@ def reshape_and_write_streaming(
             del tpm_values
 
     finally:
-        # Cerrar todos los writers — garantiza flush a disco
+        # Close all active writers — enforces persistent flush routines to disk storage
         for writer in writers.values():
             writer.close()
 
-    # Escribir quarantine si hubo unmatched
+    # Commit quarantine allocations if anomalies are encountered
     if quarantine_batches:
         write_quarantine(pa.concat_tables(quarantine_batches))
 
@@ -203,7 +203,7 @@ def reshape_and_write_streaming(
 
 
 def write_quarantine(quarantine: pa.Table) -> None:
-    """Append a cuarentena — acumula todos los unmatched en un solo parquet."""
+    """Appends data to quarantine — bundles all unmatched records into a unified Parquet file."""
     if quarantine.num_rows == 0:
         return
 
@@ -211,21 +211,21 @@ def write_quarantine(quarantine: pa.Table) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
-        existing  = pq.read_table(path)
+        existing   = pq.read_table(path)
         quarantine = pa.concat_tables([existing, quarantine])
 
     pq.write_table(quarantine, str(path), compression="snappy")
-    log.warning(f"  Cuarentena: {quarantine.num_rows:,} filas → {QUARANTINE_PATH}")
+    log.warning(f"  Quarantine warning: {quarantine.num_rows:,} rows redirected → {QUARANTINE_PATH}")
 
 
 # ---------------------------------------------------------------------------
-# 4. Progreso — para retomar si falla
+# 4. Checkpoint State — To resume processing on failure conditions
 # ---------------------------------------------------------------------------
 
 PROGRESS_FILE = "data/staging/silver/.progress.json"
 
 def load_progress() -> int:
-    """Retorna el último batch completado (0 si nunca corrió)."""
+    """Returns index references of the last successful batch completed (0 if init run)."""
     import json
     path = Path(PROGRESS_FILE)
     if not path.exists():
@@ -234,7 +234,7 @@ def load_progress() -> int:
         return json.load(f).get("last_completed_batch", 0)
 
 def save_progress(batch_idx: int, silver_rows: int, quarantine_rows: int) -> None:
-    """Guarda el progreso después de cada batch exitoso."""
+    """Saves operational checkpoint variables following a successful batch routine."""
     import json
     path = Path(PROGRESS_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,7 +247,7 @@ def save_progress(batch_idx: int, silver_rows: int, quarantine_rows: int) -> Non
 
 
 # ---------------------------------------------------------------------------
-# 5. main
+# 5. Main Orchestration
 # ---------------------------------------------------------------------------
 
 def main():
@@ -256,33 +256,33 @@ def main():
     parser.add_argument(
         "--profile",
         default=None,
-        help="Forzar perfil: SURVIVAL | BALANCED | PERFORMANCE | PRO"
+        help="Enforce operational profile runtime configuration: SURVIVAL | BALANCED | PERFORMANCE | PRO"
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Retomar desde el último batch completado"
+        help="Resume execution tracking from the last valid verified state batch"
     )
     args = parser.parse_args()
 
     t_start = time.time()
     log.info("=" * 60)
-    log.info("Phase 1 — Reshape Bronze → Parquet Staging (PyArrow)")
+    log.info("Phase 1 — Reshape Bronze → Parquet Staging Pipeline (PyArrow)")
     log.info("=" * 60)
 
-    # --- Perfil ---
+    # --- Profile Setup ---
     import psutil
     available_ram = psutil.virtual_memory().available / (1024 ** 3)
     if args.profile:
         profile = get_profile_by_name(args.profile)
-        log.info(f"Perfil forzado: {profile.name}")
+        log.info(f"Execution Profile enforced via override: {profile.name}")
     else:
         profile = detect_profile(available_ram)
 
     log.info(f"\n{profile.summary()}")
     chunk_size = profile.cols_per_chunk
 
-    # --- Leer config del tuner si existe (override del perfil) ---
+    # --- Parse Tuner configuration configs if present (Overrides default profile) ---
     OPTIMAL_CONFIG = "data/staging/silver_tuner/optimal_config.json"
     import json as _json
     _tuner_path = Path(OPTIMAL_CONFIG)
@@ -291,28 +291,28 @@ def main():
             _cfg = _json.load(f)
         chunk_size = _cfg["cols_per_chunk"]
         log.info(
-            f"Tuner config encontrada → cols_per_chunk = {chunk_size} "
-            f"(RAM pico estimado: {_cfg['peak_ram_mb']:.0f}MB, "
-            f"~{_cfg['estimated_minutes']:.0f} min total)"
+            f"Tuner parameter settings discovered → cols_per_chunk = {chunk_size} "
+            f"(Estimated peak RAM: {_cfg['peak_ram_mb']:.0f}MB, "
+            f"~{_cfg['estimated_minutes']:.0f} total runtime minutes expected)"
         )
     elif _tuner_path.exists() and args.profile:
-        log.info("Perfil forzado por --profile, ignorando tuner config")
+        log.info("Execution profile enforced via command line parameter flag --profile, bypassing auto tuner settings")
 
-    # --- Metadata y columnas ---
+    # --- Metadata loading and field parsing ---
     tissue_mapping = load_tissue_mapping(path=METADATA_PATH)
     valid, msg     = validate_tissue_mapping(tissue_mapping)
     if not valid:
-        raise ValueError(f"Tissue mapping inválido: {msg}")
-    log.info(f"Tissue mapping: {len(tissue_mapping):,} muestras → {len(set(tissue_mapping.values()))} tejidos")
+        raise ValueError(f"Invalid tissue mapping schema encountered: {msg}")
+    log.info(f"Tissue mapping index: {len(tissue_mapping):,} unique samples mapped → {len(set(tissue_mapping.values()))} discrete tissues")
 
     sample_cols = get_sample_cols()
     n_samples   = len(sample_cols)
 
-    # --- Batches ---
+    # --- Slicing Batch Arrays ---
     batches  = [sample_cols[i : i + chunk_size] for i in range(0, n_samples, chunk_size)]
     n_batches = len(batches)
 
-    # --- Resume ---
+    # --- Checkpoint Recovery Logic ---
     start_batch = 0
     silver_rows = 0
     quarantine_rows = 0
@@ -323,28 +323,28 @@ def main():
             import json
             with open(PROGRESS_FILE) as f:
                 prog = json.load(f)
-            start_batch     = last  # continuar desde el siguiente
+            start_batch     = last  # Proceed from the subsequent batch reference
             silver_rows     = prog.get("silver_rows_so_far", 0)
             quarantine_rows = prog.get("quarantine_rows_so_far", 0)
-            log.info(f"Resumiendo desde batch {start_batch + 1}/{n_batches}")
-            log.info(f"  Silver acumulado hasta ahora: {silver_rows:,} filas")
+            log.info(f"Recovering runtime pipeline environment from state batch {start_batch + 1}/{n_batches}")
+            log.info(f"  Accumulated Silver records logged up to checkpoint: {silver_rows:,} rows")
 
-    log.info(f"Total batches: {n_batches} | cols/batch: {chunk_size}")
-    log.info(f"Batches a procesar: {n_batches - start_batch}")
+    log.info(f"Total structured batch allocations: {n_batches} | columns per processing chunk: {chunk_size}")
+    log.info(f"Remaining workload batches to calculate: {n_batches - start_batch}")
 
-    # --- Loop principal ---
+    # --- Core Pipeline Processing Loop ---
     for idx, cols in enumerate(batches):
         if idx < start_batch:
             continue
 
         batch_num = idx + 1
-        log.info(f"Batch {batch_num}/{n_batches} — {len(cols)} muestras")
+        log.info(f"Processing Batch {batch_num}/{n_batches} — Parsing {len(cols)} unique metadata sample keys")
 
-        # Leer solo estas columnas del parquet Bronze — PyArrow Dataset
+        # Query and parse isolated column records from Bronze source via PyArrow Dataset pointers
         dataset = ds.dataset(BRONZE_PATH, format="parquet")
         table   = dataset.to_table(columns=METADATA_COLS + cols)
 
-        # Reshape wide→long + write streaming (sin acumulación en RAM)
+        # Execute structural wide→long pivoting + trigger direct serialization streaming (RAM optimization)
         matched_n, quarantine_n = reshape_and_write_streaming(
             table, cols, tissue_mapping, batch_num
         )
@@ -353,25 +353,25 @@ def main():
         silver_rows     += matched_n
         quarantine_rows += quarantine_n
 
-        # Guardar progreso
+        # Commit progress state to checkpoint storage
         save_progress(idx + 1, silver_rows, quarantine_rows)
-        log.info(f"  Silver acumulado: {silver_rows:,} filas")
+        log.info(f"  Current cumulative Silver rows committed to disk staging: {silver_rows:,} rows")
 
-    # --- Validación de cierre ---
+    # --- Data Lineage Audit and Closure Assertions ---
     expected = 74_628 * 19_788
     actual   = silver_rows + quarantine_rows
-    log.info(f"Row count check → esperado: {expected:,} | real: {actual:,}")
+    log.info(f"Row count integrity assertion check → Expected target: {expected:,} | Computed actual: {actual:,}")
     if actual != expected:
-        log.warning(f"Discrepancia de {expected - actual:+,} filas")
+        log.warning(f"Data lineage integrity discrepancy detected: {expected - actual:+,} missing records")
     else:
-        log.info("✅ Lineage cierra perfectamente")
+        log.info("✅ Pipeline data lineage structural checks passed successfully")
 
     duration = time.time() - t_start
     log.info("=" * 60)
-    log.info(f"Phase 1 completada en {duration:.1f}s ({duration/60:.1f} min)")
-    log.info(f"  Silver staging rows : {silver_rows:,}")
-    log.info(f"  Quarantine rows     : {quarantine_rows:,}")
-    log.info(f"  Staging path        : {STAGING_PATH}")
+    log.info(f"Phase 1 execution process finished in {duration:.1f}s ({duration/60:.1f} minutes total elapsed time)")
+    log.info(f"  Silver staging records committed : {silver_rows:,}")
+    log.info(f"  Quarantine records segregated    : {quarantine_rows:,}")
+    log.info(f"  Staging target path location     : {STAGING_PATH}")
     log.info("=" * 60)
 
     return silver_rows, quarantine_rows
@@ -381,6 +381,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        log.critical("Error no manejado en silver_phase1_reshape.py")
+        log.critical("Unhandled fatal runtime exception intercepted in silver_phase1_reshape.py")
         traceback.print_exc()
         raise SystemExit(2)
