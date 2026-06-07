@@ -1,19 +1,19 @@
 """
 src/utils/execution_profile.py
 
-Define los perfiles de ejecución del pipeline Bio-AI Lakehouse.
-Cada perfil encapsula todos los parámetros que cambian con la RAM disponible:
-cols_per_chunk, n_partitions, spill_to_disk, AQE config, etc.
+Defines execution profile configurations for the Bio-AI Lakehouse pipeline.
+Each profile encapsulates every parameter shifting alongside available hardware RAM:
+cols_per_chunk, n_partitions, spill_to_disk, AQE configurations, etc.
 
-Perfiles (de menor a mayor agresividad):
-    SURVIVAL    < 4GB   → que termine, sin importar el tiempo
-    BALANCED    4-16GB  → balance razonable
-    PERFORMANCE 16-32GB → agresivo pero seguro
-    PRO         > 32GB  → máximo aprovechamiento
+Profiles (Sorted from least to most aggressive):
+    SURVIVAL    < 4GB   → Force job completion, discarding time constraints
+    BALANCED    4-16GB  → Balanced stability and throughput compromise
+    PERFORMANCE 16-32GB → Aggressive but secure performance optimizations
+    PRO         > 32GB  → Maximum hardware infrastructure utilization
 
-Uso típico:
+Typical Usage:
     profile = detect_profile(available_ram_gb)
-    # o forzar desde CLI:
+    # Or force manually via CLI overrides:
     profile = get_profile_by_name("BALANCED")
 """
 
@@ -25,26 +25,26 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Dataclass del perfil
+# Profile Dataclass Model
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ExecutionProfile:
     """
-    Todos los parámetros que varían con el hardware en un solo objeto.
-    silver_transform.py consume esto — no sabe nada de RAM directamente.
+    Encapsulates all hardware-dependent execution parameters within a single object.
+    Consumed by silver_transform.py — abstracts raw RAM evaluations entirely.
     """
-    name:               str    # "SURVIVAL" | "BALANCED" | "PERFORMANCE" | "PRO"
-    min_ram_gb:         float  # umbral mínimo de RAM para este perfil
-    cols_per_chunk:     int    # columnas de muestras por iteración Pandas
-    n_partitions:       int    # particiones para repartition() antes del write
-    spill_to_disk:      bool   # activar off-heap + spill para presión de RAM
-    aqe_aggressive:     bool   # AQE con coalesce agresivo para RAM limitada
-    chunks_per_write:   int    # chunks a acumular antes de cada write a Delta
-    max_records_per_file: int  # filas máximas por archivo Delta (controla tamaño)
+    name:                 str    # "SURVIVAL" | "BALANCED" | "PERFORMANCE" | "PRO"
+    min_ram_gb:           float  # Minimum memory threshold boundary to qualify for this profile
+    cols_per_chunk:       int    # Total sample column steps parsed per Pandas iteration loop
+    n_partitions:         int    # Target partition counts applied to repartition() before writing
+    spill_to_disk:        bool   # Controls off-heap + physical disk spill under heavy memory pressure
+    aqe_aggressive:       bool   # Activates aggressive AQE partition coalescing constraints
+    chunks_per_write:     int    # In-memory chunks accumulated before committing write operations to Delta
+    max_records_per_file: int    # Target row ceiling threshold per individual Delta file (controls sizing)
     spark_extra_config: Dict[str, str] = field(default_factory=dict)
 
-    # Configs que deben ir en el SparkSession builder (no modificables post-inicio)
+    # Static engine parameters requiring binding during SparkSession builder initialization
     STATIC_CONFIGS = {
         "spark.memory.fraction",
         "spark.memory.storageFraction",
@@ -53,12 +53,12 @@ class ExecutionProfile:
     }
 
     def static_configs(self) -> dict:
-        """Configs que van en el builder — no modificables después de getOrCreate()."""
+        """Extracts configuration settings bound directly to the SparkSession builder."""
         return {k: v for k, v in self.spark_extra_config.items()
                 if k in self.STATIC_CONFIGS}
 
     def dynamic_configs(self) -> dict:
-        """Configs aplicables post-inicio via spark.conf.set()."""
+        """Extracts configuration settings applicable mid-lifecycle via spark.conf.set()."""
         return {k: v for k, v in self.spark_extra_config.items()
                 if k not in self.STATIC_CONFIGS}
 
@@ -79,18 +79,18 @@ class ExecutionProfile:
 
     def downgrade(self) -> Optional["ExecutionProfile"]:
         """
-        Retorna el perfil inmediatamente inferior.
-        Retorna None si ya estamos en SURVIVAL — no se puede bajar más.
+        Safely identifies and returns the next fallback execution profile.
+        Returns None if active profile matches SURVIVAL limits (lowest boundary block).
         """
         order = PROFILE_ORDER
         idx   = order.index(self.name)
         if idx == 0:
-            return None  # ya en SURVIVAL
+            return None  # Already operating at SURVIVAL baseline levels
         return PROFILES[order[idx - 1]]
 
 
 # ---------------------------------------------------------------------------
-# Definición de los cuatro perfiles
+# Definition of the Four Execution Profiles
 # ---------------------------------------------------------------------------
 
 PROFILES: Dict[str, ExecutionProfile] = {
@@ -105,20 +105,20 @@ PROFILES: Dict[str, ExecutionProfile] = {
         chunks_per_write     = 5,
         max_records_per_file = 500_000,
         spark_extra_config   = {
-            # AQE — coalesce agresivo para reducir shuffle en RAM limitada
+            # AQE — Aggressive partition coalescence to reduce shuffles under constrained memory bounds
             "spark.sql.adaptive.enabled":                          "true",
             "spark.sql.adaptive.coalescePartitions.enabled":       "true",
             "spark.sql.adaptive.advisoryPartitionSizeInBytes":     "32mb",
             "spark.sql.adaptive.skewJoin.enabled":                 "true",
-            # Forzar sort-merge join — nunca broadcast (OOM en RAM baja)
+            # Enforce sort-merge joins exclusively — suppress broadcasts to prevent low-memory Driver OOM errors
             "spark.sql.autoBroadcastJoinThreshold":                "-1",
-            # Spill a disco cuando la RAM se agota
+            # Storage memory fraction allocations, optimizing persistent disk spills when limits break
             "spark.memory.storageFraction":                        "0.2",
             "spark.memory.fraction":                               "0.6",
-            # Off-heap para reducir presión en el heap de JVM
+            # Off-heap configuration parameters to minimize tracking footprint pressures inside JVM heap spaces
             "spark.memory.offHeap.enabled":                        "true",
             "spark.memory.offHeap.size":                           "512m",
-            # Delta — reducir small files y espaciar checkpoints
+            # Delta Lake — Suppress small file generation footprints and space execution checkpoint cycles
             "spark.databricks.delta.checkpointInterval":           "10",
             "spark.sql.files.maxRecordsPerFile":                   "500000",
         },
@@ -143,7 +143,7 @@ PROFILES: Dict[str, ExecutionProfile] = {
             "spark.memory.fraction":                               "0.6",
             "spark.memory.offHeap.enabled":                        "true",
             "spark.memory.offHeap.size":                           "1g",
-            # Delta — reducir small files
+            # Delta Lake — Standard operational small file optimizations
             "spark.databricks.delta.checkpointInterval":           "10",
             "spark.sql.files.maxRecordsPerFile":                   "1000000",
         },
@@ -163,7 +163,7 @@ PROFILES: Dict[str, ExecutionProfile] = {
             "spark.sql.adaptive.coalescePartitions.enabled":       "true",
             "spark.sql.adaptive.advisoryPartitionSizeInBytes":     "128mb",
             "spark.sql.adaptive.skewJoin.enabled":                 "true",
-            # Broadcast habilitado para tablas pequeñas
+            # Broadcast strategies activated for metadata mapping sets and small structural joins safely
             "spark.sql.autoBroadcastJoinThreshold":                "10mb",
             "spark.memory.storageFraction":                        "0.5",
             "spark.memory.fraction":                               "0.75",
@@ -191,41 +191,41 @@ PROFILES: Dict[str, ExecutionProfile] = {
     ),
 }
 
-# Orden de menor a mayor — usado por downgrade()
+# Sequential execution order tracking array — utilized directly by downgrade() logic
 PROFILE_ORDER: List[str] = ["SURVIVAL", "BALANCED", "PERFORMANCE", "PRO"]
 
 
 # ---------------------------------------------------------------------------
-# Detección automática
+# Automated Profile Detection Routing
 # ---------------------------------------------------------------------------
 
 def detect_profile(available_ram_gb: float) -> ExecutionProfile:
     """
-    Detecta el perfil más agresivo que puede soportar la RAM disponible.
-    Siempre intenta el perfil más alto posible — el retry wrapper baja si falla.
+    Evaluates system telemetry metrics to flag the most efficient operational profile.
+    Always initializes matching calculations against upper thresholds — fallback retry loops downgrade if required.
 
     Args:
-        available_ram_gb: RAM disponible ahora mismo (de psutil)
+        available_ram_gb: Active unallocated physical system RAM tracked right now via psutil metrics.
 
     Returns:
-        ExecutionProfile correspondiente
+        ExecutionProfile mapping matched structural processing configurations.
     """
-    # Recorrer de mayor a menor — primer perfil que cabe en la RAM disponible
+    # Evaluate configurations from top to bottom — returning the highest boundary tier supported by host RAM
     for name in reversed(PROFILE_ORDER):
         profile = PROFILES[name]
         if available_ram_gb >= profile.min_ram_gb:
             logger.info(
-                "RAM disponible: %.1fGB → perfil detectado: %s "
+                "Available capacity verified: %.1fGB → Resolved execution profile target: %s "
                 "(cols/chunk=%d, partitions=%d)",
                 available_ram_gb, profile.name,
                 profile.cols_per_chunk, profile.n_partitions,
             )
             return profile
 
-    # Fallback absoluto — nunca debería llegar aquí
+    # Absolute fallback barrier logic — theoretically unreachable due to SURVIVAL tracking configurations at 0.0
     logger.warning(
-        "RAM disponible (%.1fGB) por debajo de todos los umbrales. "
-        "Usando SURVIVAL como fallback.",
+        "Available telemetry values (%.1fGB) registered below standard baselines. "
+        "Routing task loops to SURVIVAL fallback settings.",
         available_ram_gb,
     )
     return PROFILES["SURVIVAL"]
@@ -233,24 +233,24 @@ def detect_profile(available_ram_gb: float) -> ExecutionProfile:
 
 def get_profile_by_name(name: str) -> ExecutionProfile:
     """
-    Retorna un perfil por nombre — usado para override desde CLI.
+    Fetches an explicit execution profile directly matching target configuration name tags (CLI runtime routing).
 
     Args:
-        name: "SURVIVAL" | "BALANCED" | "PERFORMANCE" | "PRO"
+        name: Profile tag string: "SURVIVAL" | "BALANCED" | "PERFORMANCE" | "PRO"
 
     Raises:
-        ValueError si el nombre no existe
+        ValueError if string parameters break known configuration schemas.
     """
     name = name.upper().strip()
     if name not in PROFILES:
         raise ValueError(
-            f"Perfil '{name}' no existe. Opciones: {PROFILE_ORDER}"
+            f"Requested configuration signature block '{name}' is not recognized. Options: {PROFILE_ORDER}"
         )
     return PROFILES[name]
 
 
 # ---------------------------------------------------------------------------
-# CLI — smoke test
+# CLI Sandbox Smoke Testing Enclosures
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -259,14 +259,14 @@ if __name__ == "__main__":
     available = psutil.virtual_memory().available / (1024 ** 3)
     total     = psutil.virtual_memory().total     / (1024 ** 3)
 
-    print(f"\nRAM total     : {total:.1f}GB")
-    print(f"RAM disponible: {available:.1f}GB")
+    print(f"\nTotal physical memory footprint detected : {total:.1f}GB")
+    print(f"Available unallocated capacity tracking : {available:.1f}GB")
 
     profile = detect_profile(available)
     print(f"\n{profile.summary()}")
 
-    # Simular downgrade chain
-    print("\n── Downgrade chain ───────────────────────")
+    # Simulated local pipeline downgrade validation sequence loops
+    print("\n── Validating Downgrade Chain Intersections ───────────────────────")
     current = profile
     while current:
         print(f"  {current.name}")
