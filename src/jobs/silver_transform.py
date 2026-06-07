@@ -1,22 +1,22 @@
 """
-silver_transform.py — Paso 7: Ejecución Silver
+silver_transform.py — Step 7: Silver Execution
 Bio-AI Lakehouse · GTEx gene expression
 
-Estrategia:
-  - Lee schema de Bronze para obtener columnas de muestras (cero RAM)
-  - Itera en chunks de 200 columnas: lee solo esas cols del parquet
-  - wide→long con Pandas melt
-  - Join con tissue_mapping de metadata
-  - Separa unmatched samples a quarantine (append por chunk, sin acumular)
-  - Escribe Silver en Delta Lake particionado por tissue_id
-  - Quality gate + lineage al final
+Strategy:
+  - Read Bronze schema to extract sample metadata column references (zero memory footprint).
+  - Iterate across structured data in chunks of 200 columns: parse only targeted column metrics from Parquet.
+  - Execute wide→long unpivoting shapes utilizing Pandas melt.
+  - Perform structured lookups with tissue_mapping metadata dict records.
+  - Route unmatched sample rows to isolated quarantine storage (chunk-level appends, preventing memory footprint accumulation).
+  - Commit Silver tables into Delta Lake storage structures partitioned dynamically by tissue_id keys.
+  - Evaluate pipeline quality gate metrics and append updated data lineage snapshots at execution exit.
 
-Silver schema:
-  gene_id     STRING  NOT NULL  ← Name (índice parquet, reset como columna)
-  gene_symbol STRING  NOT NULL  ← Description
-  sample_id   STRING  NOT NULL  ← nombre de columna Bronze
-  tpm_value   FLOAT   NOT NULL  ← valor de celda
-  tissue_id   STRING  NOT NULL  ← join con gtex_metadata.txt
+Silver Target Table Schema:
+  gene_id      STRING  NOT NULL  ← Name (Parquet index properties, reset as native column array)
+  gene_symbol  STRING  NOT NULL  ← Description
+  sample_id    STRING  NOT NULL  ← Original Bronze source column naming conventions
+  tpm_value    FLOAT   NOT NULL  ← Target matrix expression record values
+  tissue_id    STRING  NOT NULL  ← Derived via direct join lookups against gtex_metadata.txt definitions
 """
 
 import math
@@ -49,7 +49,7 @@ from src.utils.lineage import (
 )
 
 # ---------------------------------------------------------------------------
-# Config
+# Configuration Constraints & Target References
 # ---------------------------------------------------------------------------
 
 BRONZE_PATH     = "data/bronze/gtex/gene_tpm_raw.parquet"
@@ -57,7 +57,7 @@ SILVER_PATH     = "data/silver/gtex/gene_expression_long"
 QUARANTINE_PATH = "data/quarantine/silver_unmatched_samples.parquet"
 METADATA_PATH   = "data/raw/gtex_metadata.txt"
 
-METADATA_COLS = ["Name", "Description"]  # columnas no-muestra en Bronze
+METADATA_COLS = ["Name", "Description"]  # Non-sample column boundaries inside Bronze layers
 
 SILVER_SCHEMA = StructType([
     StructField("gene_id",     StringType(), nullable=False),
@@ -75,7 +75,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 1. Spark session
+# 1. Spark Session Factory Initialization
 # ---------------------------------------------------------------------------
 
 def build_spark(profile=None) -> SparkSession:
@@ -90,44 +90,44 @@ def build_spark(profile=None) -> SparkSession:
     )
     builder = apply_to_spark_session(builder, mode="local")
 
-    # Configs estáticas del perfil — deben ir antes de getOrCreate()
+    # Static optimization parameters from active profile must be bound prior to triggering getOrCreate()
     if profile:
         for key, value in profile.static_configs().items():
             builder = builder.config(key, value)
 
     spark = configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
-    log.info("SparkSession iniciada.")
+    log.info("Target SparkSession instance initialized and ready.")
     return spark
 
 
 # ---------------------------------------------------------------------------
-# 2. Bronze — lectura lazy por chunk de columnas
+# 2. Lazy Column Metadata Extraction
 # ---------------------------------------------------------------------------
 
 def get_bronze_sample_cols() -> List[str]:
     """
-    Lee solo el schema del parquet — sin datos, costo mínimo de RAM.
-    Retorna la lista de columnas de muestras (todo excepto METADATA_COLS).
+    Scans internal Parquet structural schemas exclusively — skips record data parsing to preserve memory limits.
+    Returns array list containing sample column references (all discovered elements excluding METADATA_COLS boundaries).
     """
     schema = pq.read_schema(BRONZE_PATH)
     all_cols = schema.names
     sample_cols = [c for c in all_cols if c not in METADATA_COLS]
     log.info(
-        f"Schema Bronze leído: {len(all_cols)} columnas totales, "
-        f"{len(sample_cols)} columnas de muestras"
+        f"Bronze structural schema read verified: {len(all_cols)} aggregate columns registered, "
+        f"{len(sample_cols)} sample data target columns isolated."
     )
     return sample_cols
 
 
 def load_bronze_chunk(cols: List[str]) -> pd.DataFrame:
     """
-    Lee del parquet Bronze SOLO METADATA_COLS + cols del chunk actual.
-    Nunca carga más de chunk_size cols × 74,628 genes en RAM simultáneamente.
+    Selectively targets and loads only METADATA_COLS + specific batch sequence data arrays from Bronze sources.
+    Guarantees active RAM allocations never exceed chunk_size cols × 74,628 gene row lengths simultaneously.
     """
     df = pd.read_parquet(BRONZE_PATH, columns=METADATA_COLS + cols)
 
-    # Si 'Name' llegó como índice lo reseteamos
+    # Re-normalize data structures if 'Name' fields fallback into index states
     if df.index.name == "Name":
         df = df.reset_index()
 
@@ -135,23 +135,23 @@ def load_bronze_chunk(cols: List[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 3. Carga de metadata
+# 3. Reference Metadata Core Integration
 # ---------------------------------------------------------------------------
 
 def load_metadata() -> dict:
     mapping = load_tissue_mapping(path=METADATA_PATH)
     valid, msg = validate_tissue_mapping(mapping)
     if not valid:
-        raise ValueError(f"Tissue mapping inválido: {msg}")
+        raise ValueError(f"Encountered non-conforming tissue mapping layout criteria: {msg}")
     log.info(
-        f"Tissue mapping cargado: {len(mapping):,} muestras "
-        f"→ {len(set(mapping.values()))} tejidos"
+        f"Tissue mapping reference dict loaded: {len(mapping):,} mapped sample configurations "
+        f"→ resolved into {len(set(mapping.values()))} unique biological tissue targets."
     )
     return mapping
 
 
 # ---------------------------------------------------------------------------
-# 4. Reshape de un chunk (wide → long, Pandas)
+# 4. In-Memory Wide-to-Long Matrix Transformations (Pandas Melt)
 # ---------------------------------------------------------------------------
 
 def reshape_chunk(
@@ -159,12 +159,12 @@ def reshape_chunk(
     sample_cols: List[str],
 ) -> pd.DataFrame:
     """
-    Recibe el chunk ya leído (METADATA_COLS + sample_cols) y lo convierte
-    a formato long:
+    Consumes isolated batch matrix inputs (METADATA_COLS + sample_cols) and restructures values
+    into localized tall transactional row records:
         gene_id | gene_symbol | sample_id | tpm_value
 
-    Sin tissue_id aún — se añade en join_tissue().
-    Zeros son válidos biológicamente — NO se filtran.
+    Omits tissue_id resolution definitions here — attributes are appended inside join_tissue operations.
+    Expression metrics indicating absolute zeroes denote valid biological states — DO NOT strip or filter records.
     """
     long = df_chunk.melt(
         id_vars=METADATA_COLS,
@@ -178,7 +178,7 @@ def reshape_chunk(
 
 
 # ---------------------------------------------------------------------------
-# 5. Join con tissue mapping + separación de quarantine
+# 5. Metadata Mapping Lookups & Quality Quarantine Isolation
 # ---------------------------------------------------------------------------
 
 def join_tissue(
@@ -186,8 +186,8 @@ def join_tissue(
     tissue_mapping: dict,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Añade tissue_id via lookup directo en el dict.
-    Retorna (matched_df, quarantine_df).
+    Injects matching tissue_id properties into long data tables via direct key lookup maps.
+    Returns structurally split dataframe references containing: (matched_df, quarantine_df).
     """
     df_long["tissue_id"] = df_long["sample_id"].map(tissue_mapping)
 
@@ -201,7 +201,7 @@ def join_tissue(
 
 
 # ---------------------------------------------------------------------------
-# 6. Escritura Silver (Delta, append por chunk)
+# 6. Delta Lake Core Writing Pipeline Execution
 # ---------------------------------------------------------------------------
 
 def write_silver(
@@ -212,13 +212,13 @@ def write_silver(
     max_records: int = 500_000,
 ) -> None:
     """
-    Pandas batch → Spark DataFrame → Delta.
-    Primer write: overwrite → idempotencia completa del pipeline.
-    Resto:        append    → acumulación sin recargar lo ya escrito.
+    Converts local Pandas batch matrices → PySpark DataFrame structures → Delta Lake target tables.
+    Initial transactional batch commit: forces overwrite mode → preserves full pipeline idempotency guarantees.
+    Succeeding processing sequence frames: toggle append mode → accumulative streaming without reloading history.
 
-    repartition(n_partitions) divide el batch en tareas manejables.
-    maxRecordsPerFile controla el tamaño de archivos Delta en disco —
-    archivos grandes = menos small files = transaction log más liviano.
+    Applying repartition(n_partitions) ensures bulk data batches break down into highly manageable worker steps.
+    Enforcing maxRecordsPerFile constrains sizing bounds of target Parquet objects stored in deep disk layers —
+    larger file scales = prevents small file fragmentation = reduces transactional log tracking load overhead.
     """
     sdf = spark.createDataFrame(df_chunk, schema=SILVER_SCHEMA)
     sdf = sdf.repartition(n_partitions)
@@ -236,14 +236,14 @@ def write_silver(
 
 
 # ---------------------------------------------------------------------------
-# 7. Escritura quarantine (append por chunk, sin acumulación en RAM)
+# 7. Low-Footprint Quarantine Streaming Append Strategies
 # ---------------------------------------------------------------------------
 
 def write_quarantine_chunk(df_unmatched: pd.DataFrame) -> int:
     """
-    Escribe inmediatamente al parquet de cuarentena — sin acumular en RAM.
-    Lee el existente si ya hay algo, concatena y sobreescribe.
-    Retorna el número de filas escritas en este chunk.
+    Commits non-conforming sample arrays immediately to disk — limits local RAM accumulation bounds.
+    Inspects and evaluates existing disk targets, merges matching schemas, and triggers overwrite commits.
+    Returns total volume count of mismatched records handled inside current data slice.
     """
     if df_unmatched.empty:
         return 0
@@ -259,14 +259,14 @@ def write_quarantine_chunk(df_unmatched: pd.DataFrame) -> int:
 
     combined.to_parquet(path, index=False, compression="snappy")
     log.warning(
-        f"  Cuarentena: +{len(df_unmatched):,} filas unmatched "
-        f"(total acumulado: {len(combined):,}) → {QUARANTINE_PATH}"
+        f"  Quarantine Routing: Appended +{len(df_unmatched):,} unmatched record lines "
+        f"(Aggregated quarantine footprint total: {len(combined):,}) → Destination: {QUARANTINE_PATH}"
     )
     return len(df_unmatched)
 
 
 # ---------------------------------------------------------------------------
-# 8. Quality gate Silver
+# 8. Post-Ingestion Quality Gate Audit Routing
 # ---------------------------------------------------------------------------
 
 def run_quality_gate(
@@ -275,10 +275,10 @@ def run_quality_gate(
     spark: SparkSession,
 ):
     """
-    Lee Silver desde Delta, calcula métricas reales y ejecuta run_silver_checks.
-    Lanza PipelineQualityError si algún check crítico falla.
+    Connects to target Silver tables via Delta engine contexts, computes truth metrics, and evaluates run_silver_checks.
+    Halts pipeline orchestration and throws a PipelineQualityError on critical threshold breaches.
     """
-    log.info("Ejecutando quality gate Silver…")
+    log.info("Initiating post-ingestion verification sweep across Silver target data spaces…")
 
     sdf   = spark.read.format("delta").load(SILVER_PATH)
     total = sdf.count()
@@ -304,12 +304,12 @@ def run_quality_gate(
     if not report.passed:
         raise PipelineQualityError(report)
 
-    log.info("Quality gate Silver: PASSED ✓")
+    log.info("Silver validation pipeline Quality Gate status: PASSED ✓")
     return report
 
 
 # ---------------------------------------------------------------------------
-# 9. Lineage
+# 9. Meta-Lineage Trace Synchronization
 # ---------------------------------------------------------------------------
 
 def update_lineage(
@@ -348,11 +348,11 @@ def update_lineage(
     pipeline_meta = build_pipeline_lineage(bronze_lineage, silver_meta)
     save_lineage(pipeline_meta, PIPELINE_LINEAGE_PATH)
 
-    log.info(f"Lineage guardado → {SILVER_LINEAGE_PATH}")
+    log.info(f"Pipeline lineage trace successfully serialized and persisted → {SILVER_LINEAGE_PATH}")
 
 
 # ---------------------------------------------------------------------------
-# 10. main — orquestación
+# 10. Core Application Orchestration Wrapper
 # ---------------------------------------------------------------------------
 
 def main():
@@ -361,103 +361,103 @@ def main():
     parser.add_argument(
         "--profile",
         default=None,
-        help="Forzar perfil: SURVIVAL | BALANCED | PERFORMANCE | PRO"
+        help="Enforce manual resource profiles: SURVIVAL | BALANCED | PERFORMANCE | PRO"
     )
     args = parser.parse_args()
 
     t_start = time.time()
     log.info("=" * 60)
-    log.info("Iniciando silver_transform.py")
+    log.info("Initializing execution routine: silver_transform.py")
     log.info("=" * 60)
 
-    # --- Detectar perfil ANTES de arrancar Spark (static configs van al builder) ---
+    # --- Identify deployment profiling state BEFORE spinning up active Spark engines (Intersperse configs to builder) ---
     mem_settings  = get_spark_memory_settings(mode="local")
     available_ram = mem_settings["meta"]["available_ram_gb"]
 
     if args.profile:
         profile = get_profile_by_name(args.profile)
-        log.info(f"Perfil forzado por CLI: {profile.name}")
+        log.info(f"Target runtime optimization profile explicitly overridden via CLI context: {profile.name}")
     else:
         profile = detect_profile(available_ram)
 
     log.info(f"\n{profile.summary()}")
 
-    # --- Spark (con static configs del perfil en el builder) ---
+    # --- Initialize Spark Engine Core (Inject static structural profile parameters directly to the context builder) ---
     spark = build_spark(profile=profile)
 
-    # --- Columnas de muestras (solo schema, cero RAM de datos) ---
+    # --- Extract metadata references from schema structures (Zero resource array loading costs) ---
     tissue_mapping = load_metadata()
     bronze_lineage = load_bronze_lineage()
     sample_cols    = get_bronze_sample_cols()
     n_samples      = len(sample_cols)
-    log.info(f"Muestras a procesar: {n_samples:,}")
+    log.info(f"Aggregate volume matrix sample profiles isolated for execution: {n_samples:,}")
 
-    # Aplicar configs dinámicas del perfil (modificables post-inicio)
+    # Bind post-initialization dynamic config settings across runtime Spark boundaries
     for key, value in profile.dynamic_configs().items():
         spark.conf.set(key, value)
-    log.info("Spark config dinámica del perfil aplicada.")
+    log.info("Dynamic execution performance variables successfully mapped across the active Spark landscape.")
 
-    # chunk_size viene del perfil
+    # Sizing metrics for column loops are extracted directly from system profiles
     chunk_size = profile.cols_per_chunk
 
-    # --- Loop de chunks con escritura por lotes ---
-    # En lugar de escribir cada chunk individualmente (396 writes → Delta se degrada),
-    # acumulamos chunks_per_write chunks y hacemos un solo write por lote.
-    # Resultado: ~80 writes en lugar de 396 → transaction log crece 5x más lento.
+    # --- Column Processing Chunk Loop & Buffered Write Infrastructure Stage ---
+    # Instead of firing unmitigated individual table writes (396 concurrent calls degrade Delta storage layers),
+    # data files are cached using chunks_per_write blocks to commit combined datasets within single transactional windows.
+    # Yields: ~80 transactions instead of 396 operations → decelerates log footprint inflation roughly 5x.
     silver_row_count     = 0
     quarantine_row_count = 0
     first_write          = True
-    batch_buffer         = []   # acumula DataFrames matched hasta chunks_per_write
+    batch_buffer         = []   # Collects valid chunk dataframes up to structural limits defined by chunks_per_write
     batch_row_count      = 0
 
     chunks   = [sample_cols[i : i + chunk_size] for i in range(0, n_samples, chunk_size)]
     n_chunks = len(chunks)
-    log.info(f"Total chunks: {n_chunks} | chunks/write: {profile.chunks_per_write}")
-    log.info(f"Total writes esperados: ~{math.ceil(n_chunks / profile.chunks_per_write)}")
+    log.info(f"Constructed chunk layout: {n_chunks} iterations mapped | limits: {profile.chunks_per_write} chunks per transactional block.")
+    log.info(f"Total projected discrete storage write sequences: ~{math.ceil(n_chunks / profile.chunks_per_write)}")
 
     for idx, cols in enumerate(chunks, start=1):
-        log.info(f"Chunk {idx}/{n_chunks} — {len(cols)} muestras")
+        log.info(f"Processing chunk slice sequence {idx}/{n_chunks} — Evaluating {len(cols)} current sample features")
 
-        # Leer solo las columnas de este chunk del parquet
+        # Selectively parse and materialize target sample subsets from underlying Parquet files
         df_chunk = load_bronze_chunk(cols)
 
-        # wide → long
+        # Reshape metrics from wide profiles to extended long row patterns
         df_long = reshape_chunk(df_chunk, cols)
         del df_chunk
 
-        # join tissue
+        # Map metadata constraints to tissue keys
         matched, unmatched = join_tissue(df_long, tissue_mapping)
         del df_long
 
-        # cuarentena: escribir inmediatamente, sin acumular en RAM
+        # Process unmatched items: flush directly to disk endpoints to control memory boundaries
         quarantine_row_count += write_quarantine_chunk(unmatched)
         del unmatched
 
-        # matched vacío es un bug
+        # Empty match responses indicate missing upstream metadata associations
         if matched.empty:
             log.error(
-                f"Chunk {idx}/{n_chunks}: CERO filas matched. "
-                f"Primeras cols del chunk: {cols[:3]}… "
-                "Estos sample IDs no están en el tissue mapping — revisar gtex_metadata.txt."
+                f"Processing anomaly discovered at chunk iteration {idx}/{n_chunks}: Returned ZERO valid data correlations. "
+                f"Leading sample tags within block: {cols[:3]}… "
+                "Target identifier strings lack valid lookups inside gtex_metadata.txt — verify metadata tables."
             )
             raise RuntimeError(
-                f"Chunk {idx} produjo 0 filas matched. "
-                "Pipeline detenido para evitar Silver incompleto."
+                f"Data slice block iteration {idx} generated exactly 0 matched layout records. "
+                "Halt process tracking immediately to avoid downstream table corruption or incomplete states."
             )
 
-        # Acumular en el buffer del lote
+        # Append clean structures directly to batch queues
         batch_buffer.append(matched)
         batch_row_count += len(matched)
         del matched
 
-        # Escribir cuando el buffer llega a chunks_per_write O es el último chunk
+        # Trigger transaction writes once buffers reach capacity boundaries OR final records are parsed
         is_last_chunk    = (idx == n_chunks)
         buffer_is_full   = (len(batch_buffer) >= profile.chunks_per_write)
 
         if buffer_is_full or is_last_chunk:
             log.info(
-                f"  Escribiendo lote: {len(batch_buffer)} chunks, "
-                f"{batch_row_count:,} filas → Delta"
+                f"  Flushing transaction buffer blocks: serializing {len(batch_buffer)} combined slice structures, "
+                f"aggregating {batch_row_count:,} records → Committing to Delta storage layers"
             )
             df_batch = pd.concat(batch_buffer, ignore_index=True)
             batch_buffer.clear()
@@ -469,24 +469,24 @@ def main():
                 n_partitions   = profile.n_partitions,
                 max_records    = profile.max_records_per_file,
             )
-            first_write       = False
+            first_write        = False
             silver_row_count += batch_row_count
             batch_row_count   = 0
             del df_batch
 
-            log.info(f"  Silver acumulado: {silver_row_count:,} filas")
+            log.info(f"  Aggregated tracking footprint currently committed to Silver table spaces: {silver_row_count:,} data records")
 
-    # --- Validación de conteo total ---
-    expected = n_samples * 74_628  # genes confirmados en profiling
+    # --- Systemic Data Completeness Validation Checks ---
+    expected = n_samples * 74_628  # Target rows established during early data profiling stages
     actual   = silver_row_count + quarantine_row_count
-    log.info(f"Row count check → esperado: {expected:,} | real: {actual:,}")
+    log.info(f"Completeness assertion check → Expected: {expected:,} rows | Calculated: {actual:,} rows")
     if actual != expected:
-        log.warning(f"Discrepancia de {expected - actual:,} filas.")
+        log.warning(f"Discovered processing line margin delta of: {expected - actual:,} missing data fields.")
 
-    # --- Quality gate ---
+    # --- Post-Processing Quality Gate Evaluation Stage ---
     quality_report = run_quality_gate(silver_row_count, quarantine_row_count, spark)
 
-    # --- Lineage ---
+    # --- Update Storage Meta Trace Histories ---
     tissue_count = len(set(tissue_mapping.values()))
     duration     = time.time() - t_start
 
@@ -501,10 +501,10 @@ def main():
     )
 
     log.info("=" * 60)
-    log.info(f"silver_transform.py completado en {duration:.1f}s")
-    log.info(f"  Silver rows     : {silver_row_count:,}")
-    log.info(f"  Quarantine rows : {quarantine_row_count:,}")
-    log.info(f"  Tejidos únicos  : {tissue_count}")
+    log.info(f"Execution run for silver_transform.py concluded successfully within {duration:.1f}s")
+    log.info(f"  Silver destination data volume counts : {silver_row_count:,} rows")
+    log.info(f"  Quarantine repository tracking bounds : {quarantine_row_count:,} rows")
+    log.info(f"  Unique biological tissues resolved   : {tissue_count}")
     log.info("=" * 60)
 
     spark.stop()
@@ -514,9 +514,9 @@ if __name__ == "__main__":
     try:
         main()
     except PipelineQualityError as e:
-        log.critical(f"PIPELINE DETENIDO — Quality gate falló:\n{e}")
+        log.critical(f"PIPELINE ORCHESTRATION TERMINATED — Quality gate check failed to meet validation criteria:\n{e}")
         raise SystemExit(1)
     except Exception:
-        log.critical("Error no manejado en silver_transform.py")
+        log.critical("An unhandled exception event managed to escape out of the silver_transform.py execution stack")
         traceback.print_exc()
         raise SystemExit(2)
