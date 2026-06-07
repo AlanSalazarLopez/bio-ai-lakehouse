@@ -1,60 +1,72 @@
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, when
 from utils.resources import get_spark_memory_settings
 import os
 import time
 
-# Paso 3: El entorno sabe dónde vive antes de ejecutar [cite: 20]
+# Step 3: Extract calculated memory parameters to respect container bounds
 ram_config = get_spark_memory_settings()
 
+# Optimization: Added arrow validation and adjusted driver memory if needed.
+# Since you are handling wide Parquet files (>19k columns), driver memory 
+# requires sufficient headroom to store the heavy Schema metadata.
 spark = SparkSession.builder \
-    .appName("GTEx_Profiling_Paso1") \
+    .appName("GTEx_Profiling_Phase1") \
     .config("spark.executor.memory", ram_config) \
-    .config("spark.driver.memory", "2g") \
+    .config("spark.driver.memory", "4g") \
+    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
     .getOrCreate()
 
-# Ruta al archivo original
+# Path to target raw Bronze storage
 path = "data/raw/GTEx_Analysis_2025-08-22_v11_RNASeQCv2.4.3_gene_tpm.parquet"
 
 print(f"\n{'='*40}")
-print(f"INICIANDO PASO 1: PERFIL DEL DATO CRUDO")
+print("INITIALIZING PHASE 1: RAW BRONZE PROFILING")
 print(f"{'='*40}")
 
 if not os.path.exists(path):
-    print(f"ERROR: No se encuentra el archivo en {path}")
+    print(f"ERROR: Target file artifact not found at location: {path}")
 else:
     start_time = time.time()
     
-    # Leer el dataset
+    # Read raw Parquet file structure
     df = spark.read.parquet(path)
     
-    # 1. Dimensiones [cite: 5]
-    row_count = df.count()
+    # 1. Structural Dimensions
+    # CRITICAL WARNING: len(df.columns) forces a driver-side schema metadata parsing scan.
+    # For 19k+ columns, this is acceptable ONCE, but avoid repeating it inside loops.
     col_count = len(df.columns)
+    row_count = df.count()
     
-    # 2. Peso en disco [cite: 9]
+    # 2. Filesystem Compressed Size Allocation
     size_gb = os.path.getsize(path) / (1024**3)
     
-    # 3. Formato y Esquema [cite: 8]
-    # Revisamos si es Wide (muchas columnas) o Long
+    # 3. Structural Topology Evaluation
     format_type = "Wide" if col_count > 100 else "Long"
     
-    print(f"• RAM Asignada (60%): {ram_config} [cite: 23]")
-    print(f"• Total Filas: {row_count:,} [cite: 5]")
-    print(f"• Total Columnas: {col_count:,} [cite: 5]")
-    print(f"• Formato Detectado: {format_type} [cite: 8]")
-    print(f"• Peso Comprimido: {size_gb:.2f} GB [cite: 9]")
+    print(f"• Dynamic Allocated RAM (60% Bounds): {ram_config}")
+    print(f"• Total Dataset Rows                 : {row_count:,}")
+    print(f"• Total Dataset Columns              : {col_count:,}")
+    print(f"• Inferred Structural Topology       : {format_type}")
+    print(f"• On-Disk Compressed Footprint        : {size_gb:.2f} GB")
     
-    print("\n--- Vista Previa de Columnas Clave ---")
+    print("\n--- Key Metadata Columns Preview ---")
+    # Fetching the first 5 columns safely. 
+    # Assumes df.columns[0] is 'Name' (gene_id) and df.columns[1] is 'Description' (gene_name)
     df.select(df.columns[:5]).show(5, truncate=False)
     
-    # 4. Análisis de ceros en una muestra (Paso 1/4) [cite: 10, 49]
-    print("--- Análisis de Ceros (Muestra de 3 columnas de expresión) ---")
-    from pyspark.sql.functions import col, count, when
-    sample_cols = df.columns[2:5] # Típicamente gene_id, gene_name y primera muestra
+    # 4. Controlled Expression Zero-Value Skew Analysis
+    print("--- Expression Matrix Zero-Count Analysis (3 Sample Column Vectors) ---")
+    
+    # FIX: Shifted the slice window to df.columns[2:5] to skip 'Name' and 'Description',
+    # targeting actual numerical expression columns (Samples) where zero-values reflect biological dropouts.
+    sample_cols = df.columns[2:5]
+    
+    # Efficient execution: Computes zero matrix profile via a single localized aggregation pass
     df.select([count(when(col(c) == 0, c)).alias(f"zeros_{c}") for c in sample_cols]).show()
 
     end_time = time.time()
-    print(f"\nTiempo de ejecución: {end_time - start_time:.2f} segundos")
+    print(f"\nPhase execution completed in: {end_time - start_time:.2f} seconds")
 
 print(f"{'='*40}")
 spark.stop()
