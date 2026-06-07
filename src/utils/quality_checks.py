@@ -1,17 +1,17 @@
 """
 src/utils/quality_checks.py
 
-Funciones puras de validación de calidad para el pipeline Bio-AI Lakehouse.
-Cada check retorna un QualityResult con el veredicto y metadata suficiente
-para actualizar el data lineage sin lógica adicional en el caller.
+Pure quality validation functions for the Bio-AI Lakehouse data pipeline.
+Each automated evaluation gate yields a QualityReport mapping sufficient operational 
+telemetry and metadata to feed data lineage targets without extra logic inside callers.
 
-Diseño:
-- Funciones puras — sin side-effects, testeables sin Spark ni filesystem
-- Un resultado por check — el caller decide si parar o continuar
-- Threshold explícito en cada check — sin valores mágicos
-- Compatible con Python 3.8 (Optional[X], no X | None)
+Design Principles:
+- Pure functions — side-effect free, fully testable without active Spark sessions or I/O stubs
+- Atomic verdict targets — separate run passes; the orchestration layer controls halting thresholds
+- Explicit assertion parameters — zero hardcoded magic numbers inside verification logic
+- Strict Python 3.8 compatibility compliance (explicit Optional[X] over PEP 604 union structures)
 
-Uso típico:
+Typical Orchestration Blueprint:
     from src.utils.quality_checks import run_bronze_checks, run_silver_checks
 
     result = run_bronze_checks(df, expected_rows=74628)
@@ -30,22 +30,22 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────
-#  Resultado de un check individual
+#  Individual Validation Node Outputs
 # ─────────────────────────────────────────────
 
 @dataclass
 class CheckResult:
     """
-    Resultado de una validación individual.
-    passed=False con severity='critical' detiene el pipeline.
-    passed=False con severity='warning' se loguea pero no detiene.
+    Evaluation metrics wrapper for a single business rule pass.
+    passed=False coupled with severity='critical' triggers an immediate hard pipeline crash.
+    passed=False coupled with severity='warning' logs a tracking marker but allows progression.
     """
     name:       str
     passed:     bool
     severity:   str        # 'critical' | 'warning'
-    expected:   str        # lo que esperábamos
-    actual:     str        # lo que encontramos
-    detail:     str = ""   # contexto adicional
+    expected:   str        # Targeted configuration constraint criteria
+    actual:     str        # Live evaluation footprint metrics observed
+    detail:     str = ""   # Supplementary descriptive error traces
 
     def summary(self) -> str:
         status = "✅ PASS" if self.passed else ("❌ FAIL" if self.severity == "critical" else "⚠️  WARN")
@@ -57,17 +57,17 @@ class CheckResult:
 
 
 # ─────────────────────────────────────────────
-#  Resultado agregado de una suite de checks
+#  Aggregated Quality Suite Assessment Reports
 # ─────────────────────────────────────────────
 
 @dataclass
 class QualityReport:
     """
-    Resultado agregado de una suite de checks.
-    passed=True solo si todos los checks críticos pasaron.
-    Los warnings no afectan passed.
+    Consolidated summary tracking block evaluating an entire platform processing tier.
+    passed=True evaluates to True if and only if all critical validation checks succeed.
+    Warning indicators are bypassed during master lifecycle gate calculations.
     """
-    layer:      str                        # 'bronze' | 'silver' | 'gold'
+    layer:      str                                # 'bronze' | 'silver' | 'gold'
     checks:     List[CheckResult] = field(default_factory=list)
     run_at_utc: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -88,23 +88,23 @@ class QualityReport:
     def summary(self) -> str:
         lines = [
             f"── Quality Report [{self.layer.upper()}] ────────────────",
-            f"  resultado    : {'APROBADO ✅' if self.passed else 'FALLIDO ❌'}",
-            f"  checks       : {len(self.checks)} total, "
+            f"  Verdict Outcome  : {'APPROVED ✅' if self.passed else 'FAILED ❌'}",
+            f"  Checks Tracked   : {len(self.checks)} total, "
             f"{sum(c.passed for c in self.checks)} passed, "
             f"{len(self.critical_failures)} critical failures, "
             f"{len(self.warnings)} warnings",
-            f"  ejecutado    : {self.run_at_utc}",
-            "  detalle:",
+            f"  Executed At UTC  : {self.run_at_utc}",
+            "  Detailed Checks Summary Logs:",
         ]
         for c in self.checks:
             lines.append(f"    {c.summary()}")
         return "\n".join(lines)
 
     def to_dict(self) -> dict:
-        """Para serializar al data lineage JSON."""
+        """Serializes current audit snapshot map directly to lineage JSON store formats."""
         return {
             "layer":      self.layer,
-            "passed":     self.passed,
+            "passed":      self.passed,
             "run_at_utc": self.run_at_utc,
             "checks": [
                 {
@@ -121,7 +121,7 @@ class QualityReport:
 
 
 # ─────────────────────────────────────────────
-#  Checks individuales — funciones puras
+#  Atomic Quality Evaluation Gates (Pure Functions)
 # ─────────────────────────────────────────────
 
 def check_row_count(
@@ -130,10 +130,10 @@ def check_row_count(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que el número de filas coincide con lo esperado.
-    Úsalo para:
-    - Bronze: actual == 74,628
-    - Silver: actual == Bronze_rows × sample_cols (± quarantine)
+    Asserts structural entry metrics mirror baseline volume assumptions exactly.
+    Application mappings:
+    - Bronze tier: actual == 74,628
+    - Silver tier: actual == Bronze_rows × sample_cols (minus quarantine partitions)
     """
     passed = actual_count == expected_count
     return CheckResult(
@@ -142,7 +142,7 @@ def check_row_count(
         severity = severity,
         expected = str(expected_count),
         actual   = str(actual_count),
-        detail   = f"diferencia={actual_count - expected_count:+,}" if not passed else "",
+        detail   = f"variance footprint={actual_count - expected_count:+,}" if not passed else "",
     )
 
 
@@ -153,8 +153,8 @@ def check_nulls_in_column(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que una columna key no tenga nulls por encima del threshold.
-    max_allowed=0 significa cero tolerancia (keys primarias).
+    Validates structural column tracks do not contain unmapped null records beyond tolerance thresholds.
+    max_allowed=0 mandates zero-tolerance absolute validation boundaries (Primary Key tracks).
     """
     passed = null_count <= max_allowed
     return CheckResult(
@@ -163,7 +163,7 @@ def check_nulls_in_column(
         severity = severity,
         expected = f"<= {max_allowed}",
         actual   = str(null_count),
-        detail   = f"columna '{column_name}' tiene {null_count} nulls" if not passed else "",
+        detail   = f"target attribute '{column_name}' containing {null_count} unexpected null values" if not passed else "",
     )
 
 
@@ -173,8 +173,8 @@ def check_duplicates_in_index(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que el índice (key primaria) no tenga duplicados.
-    En Bronze, el índice es Name (Ensembl ID) — debe ser único.
+    Evaluates transactional tables to block identifier duplication inside master index definitions.
+    On Bronze configurations, the indexing column represents the unique baseline Ensembl ID array.
     """
     passed = duplicate_count == 0
     return CheckResult(
@@ -183,7 +183,7 @@ def check_duplicates_in_index(
         severity = severity,
         expected = "0",
         actual   = str(duplicate_count),
-        detail   = f"{duplicate_count} Ensembl IDs duplicados en índice" if not passed else "",
+        detail   = f"Detected {duplicate_count} duplicate Ensembl IDs inside the targeted primary index track" if not passed else "",
     )
 
 
@@ -194,11 +194,11 @@ def check_quarantine_threshold(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que los registros en cuarentena no superen el threshold.
-    Si quarantine_count / total_count > max_fraction → pipeline STOP.
+    Evaluates isolation volume densities against system operation safety ceilings.
+    If quarantine_count / total_count > max_fraction → hard pipeline execution HALT.
 
-    Default: >1% de registros en cuarentena detiene el pipeline.
-    En GTEx con nulls=0%, esperamos quarantine=0. El 1% es el límite de seguridad.
+    Default parameter: An anomaly volume breakout scaling beyond >1% drops the cluster loop.
+    Under standard GTEx distribution rules with clean raw baselines, unmapped records should hit 0.
     """
     if total_count == 0:
         fraction = 0.0
@@ -212,7 +212,7 @@ def check_quarantine_threshold(
         severity = severity,
         expected = f"<= {max_fraction:.1%}",
         actual   = f"{fraction:.2%} ({quarantine_count:,} / {total_count:,})",
-        detail   = "demasiados unmatched samples — verificar gtex_metadata.txt" if not passed else "",
+        detail   = f"Excessive unmatched sample tracking volume discovered — verify configuration context in gtex_metadata.txt" if not passed else "",
     )
 
 
@@ -223,10 +223,10 @@ def check_zero_fraction(
     severity: str = "warning",
 ) -> CheckResult:
     """
-    Verifica que la fracción de zeros en Silver sea consistente con Bronze.
-    Baseline: 51.89% de zeros en Bronze (profiling_report.json).
-    Tolerance: ±5% es aceptable dado el reshape y el join.
-    Severity warning (no crítico) — los zeros son biológicamente válidos.
+    Monitors unexpressed zero-value matrix distributions across Silver long transformations.
+    Static Reference: ~51.89% unexpressed values across raw components (profiling_report.json).
+    System window boundary: ±5% variance parameters account for metadata filtering offsets.
+    Set to warning (non-critical) — structural zeros are biologically expected gene behaviors.
     """
     lower = baseline_fraction - tolerance
     upper = baseline_fraction + tolerance
@@ -238,8 +238,8 @@ def check_zero_fraction(
         expected = f"{lower:.1%} – {upper:.1%}",
         actual   = f"{actual_fraction:.2%}",
         detail   = (
-            f"fracción de zeros {'muy alta' if actual_fraction > upper else 'muy baja'} "
-            f"vs baseline {baseline_fraction:.1%}"
+            f"Zero-expression ratio skew detected: value mapping resolves as {'critically high' if actual_fraction > upper else 'critically low'} "
+            f"relative to target baseline criteria ({baseline_fraction:.1%})"
         ) if not passed else "",
     )
 
@@ -252,11 +252,11 @@ def check_lineage_closure(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que el lineage matemático cierra después del reshape.
-    Fórmula: silver_rows + quarantine_rows == bronze_genes × bronze_samples
+    Audits execution mathematical closure rules post structural wide-to-long flattening loops.
+    Assertion identity formula: silver_rows + quarantine_rows == bronze_genes × bronze_samples
 
-    Si no cierra → filas se perdieron silenciosamente durante el reshape.
-    Este es el check más importante de Silver.
+    A validation drop indicates a silent structural record leak occurred inside transformation.
+    This check acts as the primary logical gate validating the Silver aggregation stage.
     """
     expected_total = bronze_genes * bronze_samples
     actual_total   = silver_rows + quarantine_rows
@@ -266,14 +266,14 @@ def check_lineage_closure(
         name     = "lineage_closure",
         passed   = passed,
         severity = severity,
-        expected = f"{expected_total:,} ({bronze_genes:,} × {bronze_samples:,})",
-        actual   = f"{actual_total:,} (silver={silver_rows:,} + quarantine={quarantine_rows:,})",
-        detail   = f"diferencia={actual_total - expected_total:+,} filas" if not passed else "",
+        expected = f"{expected_total:,} ({bronze_genes:,} genes × {bronze_samples:,} samples)",
+        actual   = f"{actual_total:,} (silver_layer={silver_rows:,} + quarantine_layer={quarantine_rows:,})",
+        detail   = f"Mathematical alignment breach: undetected record leak of {actual_total - expected_total:+,} row values" if not passed else "",
     )
 
 
 # ─────────────────────────────────────────────
-#  Suites — conjuntos de checks por capa
+#  Aggregated Validation Suites per Tier Layer
 # ─────────────────────────────────────────────
 
 def run_bronze_checks(
@@ -283,23 +283,22 @@ def run_bronze_checks(
     expected_rows: int = 74_628,
 ) -> QualityReport:
     """
-    Suite completa de quality checks para Bronze.
+    Executes the consolidated quality evaluation suite for raw Bronze parquet landing zones.
 
     Args:
-        df_index_duplicates:   resultado de df.index.duplicated().sum()
-        df_row_count:          resultado de len(df)
-        description_null_count: resultado de df['Description'].isnull().sum()
-        expected_rows:         74,628 por defecto (GTEx v11)
+        df_index_duplicates:    Sum total extracted via df.index.duplicated().sum()
+        df_row_count:           Count metrics output via len(df)
+        description_null_count: Null validation tracking count mapping via df['Description'].isnull().sum()
+        expected_rows:          Standard volume baseline fixed configuration floor tracking target (74,628 for GTEx v11)
 
     Returns:
-        QualityReport con passed=True si todos los críticos pasan.
+        QualityReport container. passed=True only when every critical constraint evaluates successfully.
 
-    Ejemplo:
+    Blueprint Configuration usage:
         import pandas as pd
-        df = pd.read_parquet('data/bronze/gtex/gene_tpm_raw.parquet',
-                             columns=['Description'])
+        df = pd.read_parquet('data/bronze/gtex/gene_tpm_raw.parquet', columns=['Description'])
         report = run_bronze_checks(
-            df_index_duplicates   = df.index.duplicated().sum(),
+            df_index_duplicates    = df.index.duplicated().sum(),
             df_row_count          = len(df),
             description_null_count = df['Description'].isnull().sum(),
         )
@@ -327,21 +326,21 @@ def run_silver_checks(
     quarantine_threshold: float = 0.01,
 ) -> QualityReport:
     """
-    Suite completa de quality checks para Silver post-reshape.
+    Executes the consolidated quality validation suite for the reshaped long Silver Delta tier.
 
     Args:
-        silver_row_count:       filas escritas en Delta Silver
-        quarantine_row_count:   filas enviadas a cuarentena
-        tissue_id_null_count:   nulls en columna tissue_id
-        gene_id_null_count:     nulls en columna gene_id
-        sample_id_null_count:   nulls en columna sample_id
-        actual_zero_fraction:   fracción real de zeros en tpm_value
-        bronze_genes:           74,628 por defecto
-        bronze_samples:         19,788 por defecto
-        quarantine_threshold:   fracción máxima aceptable en cuarentena (default 1%)
+        silver_row_count:        Record entry matrix counts targeted for Delta Silver tables
+        quarantine_row_count:    Orphaned metadata fragments routed out to system isolation paths
+        tissue_id_null_count:    Missing reference instances tracking inside the tissue_id column
+        gene_id_null_count:      Missing reference instances tracking inside the gene_id column
+        sample_id_null_count:    Missing reference instances tracking inside the sample_id column
+        actual_zero_fraction:    Observed expression calculation limits inside computed tpm_value distributions
+        bronze_genes:            Upstream matrix scaling factor mapping baseline variables (Default: 74,628)
+        bronze_samples:          Upstream matrix scaling factor mapping baseline variables (Default: 19,788)
+        quarantine_threshold:    Maximum allowed percentage limit before safety system faults fire (Default: 1%)
 
     Returns:
-        QualityReport con passed=True si todos los críticos pasan.
+        QualityReport tracking state summaries with absolute verification checks recorded.
     """
     report = QualityReport(layer="silver")
     total  = silver_row_count + quarantine_row_count
@@ -362,40 +361,40 @@ def run_silver_checks(
 
 
 # ─────────────────────────────────────────────
-#  Helper interno
+#  Internal Logging Subroutines
 # ─────────────────────────────────────────────
 
 def _log_report(report: QualityReport) -> None:
     if report.passed:
-        logger.info("Quality gate [%s] APROBADO — %d checks passed",
+        logger.info("Quality gate check pass [%s] APPROVED — %d constraint rules confirmed successfully",
                     report.layer.upper(), len(report.checks))
     else:
-        logger.error("Quality gate [%s] FALLIDO — %d critical failures",
+        logger.error("Quality gate check pass [%s] CRITICAL FAULT — Detected %d structural exception conditions",
                      report.layer.upper(), len(report.critical_failures))
         for failure in report.critical_failures:
-            logger.error("  %s", failure.summary())
+            logger.error("  -> Trace Exception detail: %s", failure.summary())
 
 
 # ─────────────────────────────────────────────
-#  Excepción para el pipeline
+#  Pipeline Exception Definitions
 # ─────────────────────────────────────────────
 
 class PipelineQualityError(Exception):
     """
-    Se lanza cuando un quality gate crítico falla.
-    El mensaje incluye el QualityReport completo para diagnóstico.
+    Raised directly to halt runtime scheduling when an active processing block breaches critical quality floor limits.
+    Injects complete historical diagnostic summary tables directly back to core logs.
     """
     def __init__(self, report: QualityReport):
         self.report = report
         super().__init__(
-            f"Quality gate [{report.layer.upper()}] falló con "
-            f"{len(report.critical_failures)} fallo(s) crítico(s):\n"
+            f"Orchestration terminating: Quality validation floor criteria breached at layer [{report.layer.upper()}] with "
+            f"{len(report.critical_failures)} unresolvable structural failures:\n"
             + report.summary()
         )
 
 
 # ─────────────────────────────────────────────
-#  Gold checks — funciones puras
+#  Gold Optimization & Summary Verification Layer
 # ─────────────────────────────────────────────
 
 def check_gold_row_count(
@@ -405,8 +404,8 @@ def check_gold_row_count(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que Gold tenga exactamente genes × tejidos filas.
-    Tolerancia: ±0 — Gold debe ser exacto porque es un groupBy completo.
+    Asserts structural entry volumes perfectly match the cross-joined dimensions product (genes × tissues).
+    Tolerance boundary: Absolute strict zero-variance rule — compilation groups must align flawlessly.
     """
     expected = expected_genes * expected_tissues
     passed   = actual_count == expected
@@ -414,9 +413,9 @@ def check_gold_row_count(
         name     = "gold_row_count",
         passed   = passed,
         severity = severity,
-        expected = f"{expected:,} ({expected_genes:,} genes × {expected_tissues} tejidos)",
+        expected = f"{expected:,} ({expected_genes:,} genes × {expected_tissues} distinct tissue dimensions)",
         actual   = f"{actual_count:,}",
-        detail   = f"diferencia={actual_count - expected:+,}" if not passed else "",
+        detail   = f"Aggregation balance divergence detected: volume offset counts evaluate to={actual_count - expected:+,}" if not passed else "",
     )
 
 
@@ -426,8 +425,8 @@ def check_gold_tissue_count(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que Gold tenga exactamente 68 tejidos únicos.
-    Si faltan tejidos → algún tissue_id de Silver no llegó a Gold.
+    Asserts aggregation profiles comprehensively map every single distinct target tissue segment (Default 68).
+    Missing tissue indices imply filtering processing leaks occurred downstream from Silver staging tables.
     """
     passed = actual_tissue_count == expected_tissue_count
     return CheckResult(
@@ -437,8 +436,9 @@ def check_gold_tissue_count(
         expected = str(expected_tissue_count),
         actual   = str(actual_tissue_count),
         detail   = (
-            f"{'faltan' if actual_tissue_count < expected_tissue_count else 'sobran'} "
-            f"{abs(actual_tissue_count - expected_tissue_count)} tejidos"
+            f"Dimensional validation failure: record profiling tracks show "
+            f"{'unregistered missing' if actual_tissue_count < expected_tissue_count else 'unexpected excess overhead calculations numbering'} "
+            f"{abs(actual_tissue_count - expected_tissue_count)} individual tissues"
         ) if not passed else "",
     )
 
@@ -449,9 +449,8 @@ def check_gold_min_sample_count(
     severity: str = "critical",
 ) -> CheckResult:
     """
-    Verifica que ningún grupo gen×tejido tenga sample_count == 0.
-    Un grupo con 0 muestras indica un bug en los acumuladores.
-    min_allowed=1 — todo grupo debe tener al menos 1 muestra.
+    Ensures zero empty relational tracking nodes exist across compiled dimensional lookups.
+    An active matrix record containing zero combined instances points to a functional bug inside matrix accumulators.
     """
     passed = min_sample_count >= min_allowed
     return CheckResult(
@@ -460,7 +459,7 @@ def check_gold_min_sample_count(
         severity = severity,
         expected = f">= {min_allowed}",
         actual   = str(min_sample_count),
-        detail   = "existen grupos con 0 muestras — bug en acumuladores" if not passed else "",
+        detail   = "Invalid analytical tracking groups detected: structural groupings evaluate with 0 sample points — check engine sum logic logs" if not passed else "",
     )
 
 
@@ -471,12 +470,11 @@ def check_gold_zero_fraction_consistency(
     severity:               str   = "warning",
 ) -> CheckResult:
     """
-    Verifica que el promedio de zero_fraction en Gold sea consistente
-    con la zero_fraction de Silver (52.52% medido en el quality gate Silver).
+    Validates global mean non-expression metrics are mathematically consistent with Silver inputs.
+    Baseline context: Expected target threshold anchors around ~52.52% derived from long-form verification traces.
 
-    Severity warning — una desviación no indica corrupción de datos,
-    solo una posible diferencia en la distribución por tejido.
-    Silver zero_fraction: 52.52% (confirmado en log del quality gate).
+    Severity evaluation set to warning — fractional drift marks changes in cluster density profiles, 
+    not underlying storage corruption risks.
     """
     lower  = silver_zero_fraction - tolerance
     upper  = silver_zero_fraction + tolerance
@@ -488,14 +486,14 @@ def check_gold_zero_fraction_consistency(
         expected = f"{lower:.1%} – {upper:.1%}",
         actual   = f"{avg_zero_fraction:.2%}",
         detail   = (
-            f"avg zero_fraction Gold {'muy alta' if avg_zero_fraction > upper else 'muy baja'} "
-            f"vs Silver baseline {silver_zero_fraction:.1%}"
+            f"Aggregated Gold zero-expression metrics reflect unexpected skew: value registers as {'higher than standard profiles' if avg_zero_fraction > upper else 'lower than standard profiles'} "
+            f"relative to Silver framework metrics target baseline ({silver_zero_fraction:.1%})"
         ) if not passed else "",
     )
 
 
 # ─────────────────────────────────────────────
-#  Suite Gold
+#  Gold Analytical Quality Framework Suite
 # ─────────────────────────────────────────────
 
 def run_gold_checks(
@@ -511,47 +509,47 @@ def run_gold_checks(
     silver_zero_fraction:   float = 0.5252,
 ) -> QualityReport:
     """
-    Suite completa de quality checks para Gold post-agregación.
+    Executes the comprehensive analytical validation quality suite for aggregated Gold consumption layers.
 
     Args:
-        gold_row_count:         filas escritas en Delta Gold
-        tissue_count:           tejidos únicos en Gold
-        gene_id_null_count:     nulls en columna gene_id
-        gene_symbol_null_count: nulls en columna gene_symbol
-        tissue_id_null_count:   nulls en columna tissue_id
-        min_sample_count:       mínimo de sample_count en toda la tabla
-        avg_zero_fraction:      promedio de zero_fraction en toda la tabla
-        expected_genes:         74,628 por defecto (GTEx v11)
-        expected_tissues:       68 por defecto (confirmado en Silver)
-        silver_zero_fraction:   baseline de Silver (52.52%)
+        gold_row_count:         Calculated array volumes committed to downstream Delta Gold storage targets
+        tissue_count:           Total volume count of distinct localized tissue definitions discovered
+        gene_id_null_count:     Evaluation null metrics checking the primary structural matrix key
+        gene_symbol_null_count: Evaluation null metrics checking the primary structural matrix key
+        tissue_id_null_count:   Evaluation null metrics checking the primary structural matrix key
+        min_sample_count:       Calculated floor validation density found within individual grouping maps
+        avg_zero_fraction:      Evaluated arithmetic mean tracking global silent expressions across arrays
+        expected_genes:         Total baseline gene constraints tracked via upstream systems (74,628)
+        expected_tissues:       Total tissue groupings target verified within transformation models (68)
+        silver_zero_fraction:   Historical baseline parameters pulled directly from validation states (52.52%)
 
     Returns:
-        QualityReport con passed=True si todos los críticos pasan.
+        QualityReport containing complete runtime operational tracking variables.
 
-    Checks críticos (detienen el pipeline si fallan):
-        - gold_row_count           : genes × tejidos exacto
-        - gold_tissue_count        : 68 tejidos presentes
-        - nulls en las 3 keys      : cero tolerancia
-        - gold_min_sample_count    : ningún grupo con 0 muestras
+    Critical Boundaries (Halts pipeline scheduling instantly upon error conditions):
+        - gold_row_count           : Demands flawless matrix dimensional density alignment
+        - gold_tissue_count        : Demands exact confirmation that all 68 tissue structures exist
+        - Key integrity constraints: Absolute zero-tolerance null value parameters inside identifiers
+        - gold_min_sample_count    : Forbids tracking calculations over missing or unpopulated groupings
 
-    Checks warning (se loguean pero no detienen):
-        - zero_fraction_consistency: consistente con Silver ±5%
+    Warning Evaluation Constraints (Logs operational profile drifts without breaking process execution):
+        - zero_fraction_consistency: Validates matrix zero tracking falls inside expected bounds (±5%)
     """
     report = QualityReport(layer="gold")
 
-    # Críticos — keys sin nulls
+    # Critical Identifiers — Index Integrity Null Scans
     report.checks.append(check_nulls_in_column(gene_id_null_count,     "gene_id"))
     report.checks.append(check_nulls_in_column(gene_symbol_null_count, "gene_symbol"))
     report.checks.append(check_nulls_in_column(tissue_id_null_count,   "tissue_id"))
 
-    # Críticos — integridad estructural
+    # Critical Identifiers — Relational Volume Structural Audits
     report.checks.append(check_gold_row_count(
         gold_row_count, expected_genes, expected_tissues
     ))
     report.checks.append(check_gold_tissue_count(tissue_count, expected_tissues))
     report.checks.append(check_gold_min_sample_count(min_sample_count))
 
-    # Warning — consistencia con Silver
+    # Warning Indicators — Analytical Trend Context Mapping
     report.checks.append(check_gold_zero_fraction_consistency(
         avg_zero_fraction, silver_zero_fraction
     ))
@@ -559,12 +557,13 @@ def run_gold_checks(
     _log_report(report)
     return report
 
+
 # ─────────────────────────────────────────────
-#  CLI — smoke test sin dependencias externas
+#  Local Integration Validation Harness Sandbox (CLI Targets)
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=== Smoke test Bronze (números reales del profiling) ===\n")
+    print("=== Sandbox Execution Trace: Bronze Quality Passes (Profiling Benchmarks) ===\n")
     bronze_report = run_bronze_checks(
         df_index_duplicates    = 0,
         df_row_count           = 74_628,
@@ -572,7 +571,7 @@ if __name__ == "__main__":
     )
     print(bronze_report.summary())
 
-    print("\n=== Smoke test Silver (simulado post-reshape) ===\n")
+    print("\n=== Sandbox Execution Trace: Silver Quality Passes (Post-Reshape Simulation) ===\n")
     silver_report = run_silver_checks(
         silver_row_count      = 74_628 * 19_788,
         quarantine_row_count  = 0,
@@ -583,7 +582,7 @@ if __name__ == "__main__":
     )
     print(silver_report.summary())
 
-    print("\n=== Smoke test Silver con fallo crítico (lineage no cierra) ===\n")
+    print("\n=== Sandbox Execution Trace: Simulated Silver Validation Failure Scenario (Data Leak) ===\n")
     fail_report = run_silver_checks(
         silver_row_count      = 74_628 * 19_788 - 1000,
         quarantine_row_count  = 0,
@@ -594,7 +593,7 @@ if __name__ == "__main__":
     )
     print(fail_report.summary())
 
-    print("\n=== Smoke test Gold (números esperados) ===\n")
+    print("\n=== Sandbox Execution Trace: Gold Quality Passes (Target Design Baselines) ===\n")
     gold_report = run_gold_checks(
         gold_row_count         = 74_628 * 68,
         tissue_count           = 68,
@@ -606,7 +605,7 @@ if __name__ == "__main__":
     )
     print(gold_report.summary())
 
-    print("\n=== Smoke test Gold con fallo crítico (row count incorrecto) ===\n")
+    print("\n=== Sandbox Execution Trace: Simulated Gold Validation Failure Scenario (Volume Mismatch) ===\n")
     gold_fail = run_gold_checks(
         gold_row_count         = 74_628 * 68 - 500,
         tissue_count           = 68,
