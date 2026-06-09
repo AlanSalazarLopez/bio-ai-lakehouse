@@ -1,7 +1,7 @@
 
 # Bio-AI Lakehouse
  
-**End-to-end genomic data pipeline processing 1.47 billion rows on constrained hardware.**
+**End-to-end genomic data pipeline processing 1.4 billion rows on constrained hardware.**
  
 A production-grade Medallion Architecture (Bronze → Silver → Gold) built on GTEx v11 gene expression data, designed to generate ML-ready features for variant pathogenicity classification.
  
